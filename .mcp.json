@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "slither-slicer": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--extra", "mcp", "slither-slicer-mcp"],
+      "env": {
+        "SLITHER_SLICER_PROJECT": "tests/fixtures/AccessControl.sol"
+      }
+    }
+  }
+}

@@ -15,11 +15,15 @@ dependencies = [
 
 [project.scripts]
 slither-slicer = "slither_slicer.cli:main"
+slither-slicer-mcp = "slither_slicer.mcp_server:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "ruff>=0.6",
+]
+mcp = [
+    "mcp>=1.2",
 ]
 
 [build-system]

@@ -29,6 +29,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--backward", action="store_true", help="backward slice (default)")
     p.add_argument("--forward", action="store_true", help="forward slice")
 
+    p.add_argument(
+        "--pdg",
+        metavar="FUNCTION",
+        help='dump the raw PDG (nodes + data/control edges) for a function, e.g. '
+        '"Vault.withdraw()" — for debugging the slicer, not for agents',
+    )
+
     p.add_argument("--json", metavar="PATH", help="write JSON output to PATH (else stdout)")
     p.add_argument("--source", action="store_true", help="print reconstructed source too")
     return p
@@ -80,11 +87,34 @@ def main(argv: list[str] | None = None) -> int:
             print(s.to_source())
         return 0
 
+    if args.pdg:
+        _dump_pdg(sl, args.pdg)
+        return 0
+
     print(
         "nothing to do: pass --sinks, --sources, --access-control, or --function",
         file=sys.stderr,
     )
     return 2
+
+
+def _dump_pdg(sl: Slicer, function_spec: str) -> None:
+    """Print the raw per-function PDG — nodes and their data/control edges.
+
+    This is the human researcher's window into the graph (debugging the slicer);
+    the agent surface deliberately never exposes raw edges.
+    """
+    from . import graph as g
+
+    _contract, func = sl._resolve_function(function_spec)
+    print(f"# PDG for {func.canonical_name}")
+    print("# nodes:")
+    for n in func.nodes:
+        ir = " ; ".join(str(op) for op in n.irs_ssa) or "(no ir)"
+        print(f"  {g.global_node_id(n)}  [{n.type.name}]  {ir}")
+    print("# edges (src depends on dst):")
+    for src, dst, kind in g.pdg_edges(func):
+        print(f"  {g.global_node_id(src)} -> {g.global_node_id(dst)}  [{kind}]")
 
 
 def _guarded_functions(sl: Slicer, contract_name: str) -> list[str]:

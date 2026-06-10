@@ -56,6 +56,52 @@ s.to_json()      # structured output (frozen schema — see below)
 s.to_source()    # minimal reconstructed source
 ```
 
+## MCP server (for Claude Code / agents)
+
+A stdio MCP server exposes the slicer to an agent. The design rule — the thesis of
+the project applied to the API boundary — is that **the agent chooses *what* to
+slice; the deterministic engine decides *how* to traverse.** So every tool returns
+a deterministic slice or a bounded, discrete lookup. There is deliberately **no
+tool that hands the agent raw PDG edges to walk node-by-node** — that multi-hop
+traversal is the error-prone, context-flooding work the slicer exists to absorb.
+Raw-graph access lives in the library (`slither_slicer.graph`) and CLI (`--pdg`),
+for a human debugging the slicer.
+
+Install the extra and register the server (project-scoped `.mcp.json` is included):
+
+```bash
+uv sync --extra mcp
+```
+
+```json
+{
+  "mcpServers": {
+    "slither-slicer": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--extra", "mcp", "slither-slicer-mcp"],
+      "env": { "SLITHER_SLICER_PROJECT": "path/to/project" }
+    }
+  }
+}
+```
+
+The project is taken from `SLITHER_SLICER_PROJECT`; every tool also accepts an
+optional `project` arg to analyze any project in the session. Compiled projects
+are cached per path. In a Claude Code session, run `/mcp` to confirm the server is
+**connected** and see the tools.
+
+| tool | purpose |
+|---|---|
+| `list_contracts` / `list_functions` | orientation |
+| `slice_all_sinks` / `slice_all_sources` | **compact** catalog of sinks/sources — drill in with `slice_from` |
+| `access_control_of` | full guard-context slice for a function |
+| `slice_from` | full slice from an agent-chosen `(function, variable, direction)` |
+| `find_callers` / `find_callees` | call-graph lookups |
+| `explain_dependence` | one bounded PDG path between two slice nodes |
+
+The raw PDG (for a human) is at `slither-slicer <project> --pdg "Vault.withdraw()"`.
+
 ## What a slice contains
 
 Every node carries an exact `SourceRef` (`filename`, byte `start`/`length`,
