@@ -1,0 +1,37 @@
+[project]
+name = "slither-slicer"
+version = "0.1.0"
+description = "Byte-accurate program slicing for Solidity, built on Slither's SSA IR / data-dependence / CFG."
+readme = "README.md"
+authors = [
+    { name = "Maxime", email = "maxime@3f.xyz" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "slither-analyzer>=0.10.0",
+    "crytic-compile>=0.3.7",
+    "solc-select>=1.0.4",
+]
+
+[project.scripts]
+slither-slicer = "slither_slicer.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
