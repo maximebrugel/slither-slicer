@@ -30,9 +30,9 @@ uv run slither-slicer path/to/project --contract Vault --sinks
 # every source slice (forward slices)
 uv run slither-slicer path/to/project --contract Vault --sources
 
-# explicit criterion
+# explicit criterion (--depth controls how many call boundaries to cross)
 uv run slither-slicer path/to/project \
-    --function "Vault.withdraw()" --var amount --backward --json out.json
+    --function "Vault.withdraw()" --var amount --backward --depth 2 --json out.json
 
 # access-control guard slices for a contract
 uv run slither-slicer path/to/project --access-control Vault
@@ -51,6 +51,8 @@ guards = sl.access_control_of("Vault.withdraw()")    # guard-context Slice
 
 s = sl.backward_slice(function="Vault.withdraw()", variable="amount")
 s = sl.forward_slice(function="Vault.deposit()", variable="msg.value")
+s = sl.slice_at_node("Vault.withdraw()#5")              # exact-node criterion
+# every slicing method takes depth=N (call boundaries to cross, default 1)
 
 s.to_json()      # structured output (frozen schema — see below)
 s.to_source()    # minimal reconstructed source
@@ -88,15 +90,16 @@ uv sync --extra mcp
 
 The project is taken from `SLITHER_SLICER_PROJECT`; every tool also accepts an
 optional `project` arg to analyze any project in the session. Compiled projects
-are cached per path. In a Claude Code session, run `/mcp` to confirm the server is
-**connected** and see the tools.
+are cached per path and recompiled automatically when a `.sol` file changes, so
+slices never describe code that no longer exists. In a Claude Code session, run
+`/mcp` to confirm the server is **connected** and see the tools.
 
 | tool | purpose |
 |---|---|
-| `list_contracts` / `list_functions` | orientation |
-| `slice_all_sinks` / `slice_all_sources` | **compact** catalog of sinks/sources — drill in with `slice_from` |
+| `list_contracts` / `list_functions` | orientation — bases and libraries included |
+| `slice_all_sinks` / `slice_all_sources` | **compact** catalog of sinks/sources — drill in with `slice_from(node_id=…)` |
 | `access_control_of` | full guard-context slice for a function |
-| `slice_from` | full slice from an agent-chosen `(function, variable, direction)` |
+| `slice_from` | full slice from an agent-chosen criterion: a `node_id` from any slice/summary, or `(function, variable)`; `direction`, `depth` |
 | `find_callers` / `find_callees` | call-graph lookups |
 | `explain_dependence` | one bounded PDG path between two slice nodes |
 
@@ -118,9 +121,13 @@ source, never a paraphrase. Each node is tagged with **why** it was included:
 
 A slice also surfaces:
 
-- `guarded` — does the criterion's function restrict its caller? (modifier, an
-  in-body `require(msg.sender == …)`, or Slither's `is_protected`). An unguarded
-  value/authority/state sink is the headline audit signal.
+- `guarded` — does the criterion's function restrict its caller's *identity*? A
+  modifier that reads `msg.sender`/`tx.origin` (transitively — OZ `onlyOwner` →
+  `_checkOwner()`), or an in-body identity check (`require(msg.sender == …)`, a
+  boolean allowlist lookup, a checker call taking the caller). Merely *reading*
+  the caller does not count: `nonReentrant` and
+  `require(balances[msg.sender] >= amount)` restrict nothing about who may call.
+  An unguarded value/authority/state sink is the headline audit signal.
 - `calls` — **every** call in the slice, classified: `library`/`internal` are
   in-scope (we descended into them), `external`/`delegatecall`/`low_level` are
   opaque boundaries. `external_calls` is the opaque subset as strings.
@@ -147,17 +154,26 @@ retrieval tools. See `tests/test_model.py` for the asserted schema.
   code that itself reverts (a validation library like `LibChecks.checkNotZero`)
   is recognised the same way, so it guards its callsite like an inline `require`.
 - **PDG + slicing** (`pdg.py`, `slicer.py`) — a slice is reachability over the
-  union of those edges, plus modifier-guard inclusion and one level of
-  inter-procedural stitching (`interproc.py`). Slither's SSA already inlines a
-  callee's formals as entry `Phi`s of the caller's actuals, which we use to map
-  arguments across the call boundary. **Library calls** (`using Lib for T`) are
-  in-scope code, so they are descended into like internal calls — not treated as
-  opaque (this recovers the bulk of a real project's call graph).
+  union of those edges, plus modifier-guard inclusion and depth-limited
+  inter-procedural stitching (`interproc.py`; default one boundary, raise with
+  `depth=`/`--depth`). Slither's SSA already inlines a callee's formals as entry
+  `Phi`s of the caller's actuals, which we use to map arguments across the call
+  boundary. **Library calls** (`using Lib for T`) are in-scope code, so they are
+  descended into like internal calls — not treated as opaque (this recovers the
+  bulk of a real project's call graph).
+- **Implicit flows (forward)** — a statement guarded by a tainted *branch*
+  (`if (v > 1 ether) { won = true; }`) is in the forward slice, and taint
+  continues through it. Abort-only nodes are deliberately excluded from this
+  closure: every statement after a tainted `require` is technically
+  control-dependent on it, and including them would drag the whole tail of the
+  function into every slice.
 - **Catalog** (`catalog/`) — Solidity-specific sink/source detectors that produce
   criteria automatically (ether transfers, external calls, `delegatecall`,
   `selfdestruct`, privileged state writes, arbitrary-call to an attacker-
   controlled target; parameters, `msg.sender`/`tx.origin`, `msg.value`,
-  environment/oracle returns).
+  environment/oracle returns). Scanning is **inherited-inclusive**: a sink
+  declared in a base contract is live code of the derived contract, so it is
+  cataloged there (and ascent climbs into base-declared callers).
 
 ## Known limitations (marked, never silently dropped)
 
@@ -171,7 +187,8 @@ going when it hits:
 - **Cross-function state effects** — v1 flags the state vars a slice touches but
   does not stitch full state dataflow between functions (the agent layer does
   that reasoning).
-- **Inter-procedural depth** — one level only; deeper calls are marked
+- **Inter-procedural depth** — depth-limited (default one boundary; raise with
+  `depth=`/`--depth`); calls beyond the limit are marked
   (`interproc-depth-limit:<fn>`).
 - **External / proxy / `delegatecall` boundaries** — calls to *other contracts*
   are opaque; recorded in `external_calls` / `calls` (kind `external`/`low_level`/

@@ -28,6 +28,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--var", help="variable name for the explicit criterion")
     p.add_argument("--backward", action="store_true", help="backward slice (default)")
     p.add_argument("--forward", action="store_true", help="forward slice")
+    p.add_argument(
+        "--depth",
+        type=int,
+        default=1,
+        help="call boundaries an explicit slice may cross (default 1)",
+    )
 
     p.add_argument(
         "--pdg",
@@ -79,9 +85,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.function:
         if args.forward:
-            s = sl.forward_slice(function=args.function, variable=args.var)
+            s = sl.forward_slice(function=args.function, variable=args.var, depth=args.depth)
         else:
-            s = sl.backward_slice(function=args.function, variable=args.var)
+            s = sl.backward_slice(function=args.function, variable=args.var, depth=args.depth)
         _emit(to_json_str(s), args.json)
         if args.source:
             print(s.to_source())

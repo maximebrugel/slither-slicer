@@ -62,9 +62,13 @@ def resolved_library_calls(function: Function) -> list[tuple[Node, LibraryCall, 
 
 
 def callsites_of(contract: Contract, callee: Function) -> list[tuple[Function, Node, InternalCall]]:
-    """All in-scope internal callsites that invoke ``callee``: ``(caller, node, op)``."""
+    """All in-scope internal callsites that invoke ``callee``: ``(caller, node, op)``.
+
+    Inherited-inclusive: a caller declared in a base contract is live code of
+    the derived contract, so ascent must climb into it too.
+    """
     out = []
-    for caller in contract.functions_and_modifiers_declared:
+    for caller in contract.functions_and_modifiers:
         for node, op, target in resolved_internal_calls(caller):
             if target is callee:
                 out.append((caller, node, op))

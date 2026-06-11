@@ -15,6 +15,7 @@ from .catalog.sinks import find_sinks
 from .catalog.sources import find_sources
 from .criteria import Direction, SliceCriterion
 from .dependence.data import op_reads
+from .graph import resolve_node
 from .loader import Loader
 from .model import Slice, SliceNode, SourceRef
 from .slicer import _Slicer, backward_slice, forward_slice
@@ -114,7 +115,7 @@ class Slicer:
         return [forward_slice(c, crit) for crit in find_sources(c)]
 
     # -- explicit criteria -------------------------------------------------
-    def backward_slice(self, function: str, variable: str | None = None) -> Slice:
+    def backward_slice(self, function: str, variable: str | None = None, depth: int = 1) -> Slice:
         contract, func = self._resolve_function(function)
         var = self._resolve_variable(func, variable) if variable else None
         node = (
@@ -123,9 +124,9 @@ class Slicer:
             else (func.entry_point or func.nodes[0])
         )
         crit = SliceCriterion(node=node, variable=var, direction=Direction.BACKWARD)
-        return backward_slice(contract, crit)
+        return backward_slice(contract, crit, depth=depth)
 
-    def forward_slice(self, function: str, variable: str | None = None) -> Slice:
+    def forward_slice(self, function: str, variable: str | None = None, depth: int = 1) -> Slice:
         contract, func = self._resolve_function(function)
         var = self._resolve_variable(func, variable) if variable else None
         node = (
@@ -134,7 +135,26 @@ class Slicer:
             else (func.entry_point or func.nodes[0])
         )
         crit = SliceCriterion(node=node, variable=var, direction=Direction.FORWARD)
-        return forward_slice(contract, crit)
+        return forward_slice(contract, crit, depth=depth)
+
+    def slice_at_node(
+        self,
+        node_id: str,
+        variable: str | None = None,
+        direction: Direction = Direction.BACKWARD,
+        depth: int = 1,
+    ) -> Slice:
+        """Slice from an exact node — ``node_id`` as emitted in slices and
+        catalog summaries (``"Vault.withdraw(uint256)#5"``). This is the drill-in
+        path for whole-node catalog criteria (delegatecall / external-call
+        sinks), which have no variable to name."""
+        contract = self._contract(node_id.split(".", 1)[0])
+        node = resolve_node(contract, node_id)
+        var = self._resolve_variable(node.function, variable) if variable else None
+        crit = SliceCriterion(node=node, variable=var, direction=direction)
+        if direction is Direction.BACKWARD:
+            return backward_slice(contract, crit, depth=depth)
+        return forward_slice(contract, crit, depth=depth)
 
     # -- access control ----------------------------------------------------
     def access_control_of(self, function: str) -> Slice:

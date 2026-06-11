@@ -42,6 +42,26 @@ def library() -> Slicer:
     return _slicer("Library.sol")
 
 
+@pytest.fixture(scope="session")
+def inherited() -> Slicer:
+    return _slicer("Inherited.sol")
+
+
+@pytest.fixture(scope="session")
+def guards() -> Slicer:
+    return _slicer("Guards.sol")
+
+
+@pytest.fixture(scope="session")
+def implicit_flow() -> Slicer:
+    return _slicer("ImplicitFlow.sol")
+
+
+@pytest.fixture(scope="session")
+def proxy() -> Slicer:
+    return _slicer("Proxy.sol")
+
+
 def node_set(sl) -> set[tuple[str, str]]:
     """(node_id, reason) pairs for a slice."""
     return {(n.node_id, n.reason) for n in sl.nodes}

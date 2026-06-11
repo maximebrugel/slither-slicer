@@ -70,14 +70,18 @@ def _matches(ssa_var, target) -> bool:
 
 
 class _Slicer:
-    def __init__(self, contract: Contract):
+    def __init__(self, contract: Contract, depth: int = MAX_BOUNDARY_CROSSINGS):
         self.contract = contract
+        self.depth = depth  # call-boundary crossings allowed per trace
         self.included: dict[Node, str] = {}  # node -> reason
         self.notes: list[str] = []
         self.external_calls: list[str] = []
         self.calls: list[dict] = []
         self.events_emitted: list[dict] = []
-        self._visited: set[int] = set()
+        # id(ssa_var) -> lowest crossings it was processed at. A var first seen
+        # deep in a call chain (high crossings, little budget left) must still be
+        # reprocessed if reached again nearer the criterion.
+        self._visited: dict[int, int] = {}
         # worklist entries: (ssa_var, owning_function, crossings)
         self._work: list[tuple[object, Function, int]] = []
 
@@ -109,9 +113,13 @@ class _Slicer:
 
         if getattr(var, "non_ssa_version", None) is not None:
             return [var]  # already an SSA-versioned variable
-        if isinstance(var, (SolidityVariableComposed, Constant)):
+        if isinstance(var, Constant):
             return [var]
 
+        # SolidityVariableComposed (msg.sender, msg.value, ...) falls through on
+        # purpose: a by-name criterion is a *fresh* instance that the id-keyed
+        # def/use maps would never match — collect the real IR occurrences
+        # instead (``_matches`` compares by string for them).
         return self._ssa_versions_of(function, var, node, direction)
 
     def _ssa_versions_of(self, function, target, node, direction) -> list:
@@ -152,9 +160,10 @@ class _Slicer:
     def _run_backward_data(self) -> None:
         while self._work:
             var, function, crossings = self._work.pop()
-            if id(var) in self._visited:
+            prev = self._visited.get(id(var))
+            if prev is not None and prev <= crossings:
                 continue
-            self._visited.add(id(var))
+            self._visited[id(var)] = crossings
 
             pdg = build_pdg(function)
             site = pdg.def_site(var)
@@ -186,7 +195,7 @@ class _Slicer:
     def _maybe_ascend(self, var, function: Function, crossings: int) -> None:
         """``var`` has no in-function definition. If it is a formal parameter and
         ``function`` is called from in scope, climb to the actuals (one level)."""
-        if crossings >= MAX_BOUNDARY_CROSSINGS:
+        if crossings >= self.depth:
             return
         target = getattr(var, "non_ssa_version", var)
         if target not in function.parameters:
@@ -199,7 +208,7 @@ class _Slicer:
 
     def _descend_backward(self, op, crossings: int) -> None:
         # op is a descendable call (InternalCall or LibraryCall); see is_descendable_call.
-        if crossings >= MAX_BOUNDARY_CROSSINGS:
+        if crossings >= self.depth:
             self._note(f"interproc-depth-limit:{op.function.canonical_name}")
             return
         callee = op.function
@@ -221,18 +230,24 @@ class _Slicer:
         for v in self._resolve_seed_vars(criterion):
             self._push(v, func, 0)
 
-        self._run_forward_data()
+        self._saturate_forward()
         self._forward_control(criterion.node)
         self._include_modifier_guards(func)
         self._run_backward_data()  # resolve modifier-guard data deps
         return self._finish(criterion)
 
+    def _saturate_forward(self) -> None:
+        self._run_forward_data()
+        while self._forward_implicit_step():
+            self._run_forward_data()
+
     def _run_forward_data(self) -> None:
         while self._work:
             var, function, crossings = self._work.pop()
-            if id(var) in self._visited:
+            prev = self._visited.get(id(var))
+            if prev is not None and prev <= crossings:
                 continue
-            self._visited.add(id(var))
+            self._visited[id(var)] = crossings
 
             pdg = build_pdg(function)
             for unode, uop in pdg.use_sites(var):
@@ -249,7 +264,7 @@ class _Slicer:
 
     def _descend_forward(self, op, tainted_actual, crossings: int) -> None:
         # op is a descendable call (InternalCall or LibraryCall); see is_descendable_call.
-        if crossings >= MAX_BOUNDARY_CROSSINGS:
+        if crossings >= self.depth:
             self._note(f"interproc-depth-limit:{op.function.canonical_name}")
             return
         callee = op.function
@@ -271,6 +286,28 @@ class _Slicer:
         for node, guards in pdg.control_parents.items():
             if criterion_node in guards and node.type not in _SCAFFOLDING:
                 self._add_node(node, "control-dep")
+
+    def _forward_implicit_step(self) -> bool:
+        """Implicit flows: a statement guarded by an included *true branch*
+        (``if``/loop — two or more real CFG successors) is influenced by the
+        criterion, so include it and keep tainting its definitions. Abort-only
+        nodes (``require``/reverting calls) are deliberately excluded — their
+        control-dependents are *everything after them*, which would drag the
+        whole tail of the function into every slice with a tainted check."""
+        added = False
+        for branch in [n for n in self.included if len(n.sons) >= 2]:
+            pdg = build_pdg(branch.function)
+            for node, guards in pdg.control_parents.items():
+                if branch not in guards or node in self.included:
+                    continue
+                if node.type in _SCAFFOLDING:
+                    continue
+                self._add_node(node, "control-dep")
+                added = True
+                for op in node.irs_ssa:
+                    for d in op_defs(op):
+                        self._push(d, node.function, 0)
+        return added
 
     # == control closure (backward) ========================================
     def _control_closure_step(self) -> bool:
@@ -398,9 +435,13 @@ class _Slicer:
         return sorted(out)
 
 
-def backward_slice(contract: Contract, criterion: SliceCriterion) -> Slice:
-    return _Slicer(contract).backward(criterion)
+def backward_slice(
+    contract: Contract, criterion: SliceCriterion, depth: int = MAX_BOUNDARY_CROSSINGS
+) -> Slice:
+    return _Slicer(contract, depth=depth).backward(criterion)
 
 
-def forward_slice(contract: Contract, criterion: SliceCriterion) -> Slice:
-    return _Slicer(contract).forward(criterion)
+def forward_slice(
+    contract: Contract, criterion: SliceCriterion, depth: int = MAX_BOUNDARY_CROSSINGS
+) -> Slice:
+    return _Slicer(contract, depth=depth).forward(criterion)

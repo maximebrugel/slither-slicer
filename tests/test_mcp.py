@@ -20,7 +20,9 @@ IP = str(FIXTURES / "Interproc.sol")
 
 
 def test_list_contracts():
-    assert m.list_contracts_impl(AC)["contracts"] == ["AccessControl"]
+    assert m.list_contracts_impl(AC)["contracts"] == [
+        {"name": "AccessControl", "kind": "contract", "is_most_derived": True}
+    ]
 
 
 def test_list_functions_shape():
@@ -135,4 +137,5 @@ def test_missing_project_raises(monkeypatch):
 
 def test_env_project_used(monkeypatch):
     monkeypatch.setenv("SLITHER_SLICER_PROJECT", AC)
-    assert m.list_contracts_impl(None)["contracts"] == ["AccessControl"]
+    names = [c["name"] for c in m.list_contracts_impl(None)["contracts"]]
+    assert names == ["AccessControl"]

@@ -70,7 +70,9 @@ def find_sinks(contract: Contract) -> list[SliceCriterion]:
     crits: list[SliceCriterion] = []
     entries = _entry_points(contract)
 
-    for func in contract.functions_and_modifiers_declared:
+    # Inherited-inclusive: a sink declared in a base contract is live code of the
+    # derived contract — scanning only declared functions would hide it.
+    for func in contract.functions_and_modifiers:
         for node in func.nodes:
             for op in node.irs_ssa:
                 crits.extend(_call_sink_for_op(node, op))
@@ -102,6 +104,8 @@ def _call_sink_for_op(node, op: Operation) -> list[SliceCriterion]:
         if fname == "delegatecall":
             # whole-node criterion: trace everything flowing into the call
             return [_crit(node, None, "sink:delegatecall")]
+        if fname == "staticcall":
+            return []  # read-only: cannot move value or change state
         if _has_nonzero_value(op):
             return [_crit(node, op.call_value, "sink:ether_transfer")]
         return [_crit(node, None, _external_origin(node, op))]

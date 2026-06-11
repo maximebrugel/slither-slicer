@@ -22,11 +22,12 @@ env var. Compiled projects are cached per path (compilation is the slow part).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
 
-from . import Slicer
+from . import Direction, Slicer
 from . import graph as g
 from .calls import classify_call
 from .interproc import callsites_of
@@ -38,7 +39,8 @@ if TYPE_CHECKING:
 
 mcp = FastMCP("slither-slicer")
 
-_SLICERS: dict[str, Slicer] = {}
+# project path -> (slicer, source snapshot at compile time)
+_SLICERS: dict[str, tuple[Slicer, tuple[int, int]]] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -54,11 +56,32 @@ def _resolve_project(project: str | None) -> str:
     return path
 
 
+def _project_snapshot(path: str) -> tuple[int, int]:
+    """``(file_count, max_mtime_ns)`` over the project's ``.sol`` files — a cheap
+    change detector, so an edit mid-session triggers a recompile instead of
+    silently serving slices of code that no longer exists."""
+    p = Path(path)
+    files = [p] if p.is_file() else p.rglob("*.sol")
+    count, latest = 0, 0
+    for f in files:
+        try:
+            mtime = f.stat().st_mtime_ns
+        except OSError:
+            continue
+        count += 1
+        latest = max(latest, mtime)
+    return count, latest
+
+
 def _get_slicer(project: str | None) -> Slicer:
     path = _resolve_project(project)
-    if path not in _SLICERS:
-        _SLICERS[path] = Slicer(path)
-    return _SLICERS[path]
+    snapshot = _project_snapshot(path)
+    cached = _SLICERS.get(path)
+    if cached is not None and cached[1] == snapshot:
+        return cached[0]
+    slicer = Slicer(path)
+    _SLICERS[path] = (slicer, snapshot)
+    return slicer
 
 
 # --------------------------------------------------------------------------- #
@@ -96,8 +119,21 @@ def _summarize(s: Slice) -> dict:
 # tool implementations (plain, independently testable)
 # --------------------------------------------------------------------------- #
 def list_contracts_impl(project: str | None = None) -> dict:
+    """Every contract in the project — bases and libraries included, since
+    inherited code is live code: a sink declared in a base is reachable through
+    the derived contract."""
     sl = _get_slicer(project)
-    return {"contracts": [c.name for c in sl._loader.contracts]}
+    derived = {id(c) for c in sl.slither.contracts_derived}
+    contracts = [
+        {
+            "name": c.name,
+            "kind": c.contract_kind or "contract",
+            "is_most_derived": id(c) in derived,
+        }
+        for c in sl.slither.contracts
+    ]
+    contracts.sort(key=lambda c: (not c["is_most_derived"], c["name"]))
+    return {"contracts": contracts}
 
 
 def list_functions_impl(contract: str, project: str | None = None) -> dict:
@@ -148,18 +184,28 @@ def access_control_of_impl(function: str, project: str | None = None) -> dict:
 
 
 def slice_from_impl(
-    function: str,
+    function: str | None = None,
     variable: str | None = None,
     direction: str = "backward",
     project: str | None = None,
+    node_id: str | None = None,
+    depth: int = 1,
 ) -> dict:
     sl = _get_slicer(project)
     d = direction.lower()
+    if d not in ("backward", "forward"):
+        raise ValueError(f"direction must be 'backward' or 'forward', got {direction!r}")
+    if node_id is not None:
+        # Exact-node criterion — the drill-in path for catalog summaries, whose
+        # `criterion_node_id` names the precise sink/source node (a whole-node
+        # criterion like a delegatecall has no variable to slice by).
+        dirn = Direction.BACKWARD if d == "backward" else Direction.FORWARD
+        return sl.slice_at_node(node_id, variable=variable, direction=dirn, depth=depth).to_json()
+    if function is None:
+        raise ValueError("pass `function` (with optional `variable`) or `node_id`")
     if d == "backward":
-        return sl.backward_slice(function=function, variable=variable).to_json()
-    if d == "forward":
-        return sl.forward_slice(function=function, variable=variable).to_json()
-    raise ValueError(f"direction must be 'backward' or 'forward', got {direction!r}")
+        return sl.backward_slice(function=function, variable=variable, depth=depth).to_json()
+    return sl.forward_slice(function=function, variable=variable, depth=depth).to_json()
 
 
 def find_callers_impl(function: str, project: str | None = None) -> dict:
@@ -172,7 +218,9 @@ def find_callers_impl(function: str, project: str | None = None) -> dict:
     return {
         "function": func.canonical_name,
         "callers": callers,
-        "is_entry_point": func.visibility in ("public", "external") and not callers,
+        # Entry-point status is visibility alone: a public function is directly
+        # attacker-reachable even if it also has internal callers.
+        "is_entry_point": func.visibility in ("public", "external"),
     }
 
 
@@ -249,7 +297,8 @@ def _path_result(path, note: str) -> dict:
 # --------------------------------------------------------------------------- #
 @mcp.tool()
 def list_contracts(project: str | None = None) -> dict:
-    """List the contracts defined in the project."""
+    """List every contract in the project (bases and libraries included), with
+    its kind and whether it is most-derived (deployable)."""
     return list_contracts_impl(project)
 
 
@@ -263,17 +312,18 @@ def list_functions(contract: str, project: str | None = None) -> dict:
 @mcp.tool()
 def slice_all_sinks(contract: str, project: str | None = None) -> dict:
     """Compact catalog of every sink in a contract (ether transfers, external
-    calls, delegatecall, selfdestruct, privileged state writes). Returns a
-    summary per sink, not full slices — drill into one with `slice_from` using
-    its `function` and `variable`."""
+    calls, delegatecall, selfdestruct, privileged state writes), inherited code
+    included. Returns a summary per sink, not full slices — drill into one with
+    `slice_from`, passing its `criterion_node_id` as `node_id`."""
     return slice_all_sinks_impl(contract, project)
 
 
 @mcp.tool()
 def slice_all_sources(contract: str, project: str | None = None) -> dict:
     """Compact catalog of every untrusted source in a contract (parameters,
-    msg.sender/value, tx.origin, environment/oracle returns). Drill in with
-    `slice_from` (direction='forward')."""
+    msg.sender/value, tx.origin, environment/oracle returns), inherited code
+    included. Drill in with `slice_from` (direction='forward'), passing the
+    summary's `criterion_node_id` as `node_id`."""
     return slice_all_sources_impl(contract, project)
 
 
@@ -286,18 +336,22 @@ def access_control_of(function: str, project: str | None = None) -> dict:
 
 @mcp.tool()
 def slice_from(
-    function: str,
+    function: str | None = None,
     variable: str | None = None,
     direction: str = "backward",
     project: str | None = None,
+    node_id: str | None = None,
+    depth: int = 1,
 ) -> dict:
-    """Deterministic program slice from an agent-chosen criterion. `function` is
-    like 'Vault.withdraw()'; `variable` is a variable name in it (omit for a
-    whole-node criterion); `direction` is 'backward' (what influences it) or
-    'forward' (what it influences). Returns the full slice with byte-accurate
-    source for every node, control/data/modifier-guard reasons, touched state and
-    external calls."""
-    return slice_from_impl(function, variable, direction, project)
+    """Deterministic program slice from an agent-chosen criterion. Either pass
+    `node_id` (a node id from a slice or catalog summary's `criterion_node_id`,
+    like 'Vault.withdraw(uint256)#5') to slice from that exact statement, or
+    `function` (like 'Vault.withdraw()') with an optional `variable` name in it.
+    `direction` is 'backward' (what influences it) or 'forward' (what it
+    influences); `depth` is how many call boundaries to cross (default 1).
+    Returns the full slice with byte-accurate source for every node,
+    control/data/modifier-guard reasons, touched state and external calls."""
+    return slice_from_impl(function, variable, direction, project, node_id, depth)
 
 
 @mcp.tool()

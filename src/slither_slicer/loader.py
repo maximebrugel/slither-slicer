@@ -19,14 +19,15 @@ _VERSION_RE = re.compile(r"(\d+\.\d+\.\d+)")
 
 
 def _detect_pragma_version(target: str) -> str | None:
-    """Best-effort: read the first concrete version out of a ``pragma`` line.
+    """Best-effort: read pragma floors across the project and pick the highest.
 
     Only used as a hint for ``solc-select`` when the caller did not pin a
-    version; a caret/range pragma resolves to its floor, which compiles in the
-    common case.
+    version. The *max* floor (not the first file's) is what compiles the common
+    mixed case — ``^0.8.4`` next to ``^0.8.20`` needs 0.8.20.
     """
     path = Path(target)
     files = [path] if path.is_file() else list(path.rglob("*.sol"))
+    floors: list[tuple[int, ...]] = []
     for f in files[:50]:
         try:
             text = f.read_text(encoding="utf-8", errors="ignore")
@@ -36,8 +37,10 @@ def _detect_pragma_version(target: str) -> str | None:
         if m:
             v = _VERSION_RE.search(m.group(1))
             if v:
-                return v.group(1)
-    return None
+                floors.append(tuple(int(x) for x in v.group(1).split(".")))
+    if not floors:
+        return None
+    return ".".join(str(x) for x in max(floors))
 
 
 def _select_solc(version: str) -> None:

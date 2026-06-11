@@ -6,6 +6,7 @@ agent layer can always recover real source bytes rather than an LLM paraphrase.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING
@@ -17,9 +18,16 @@ if TYPE_CHECKING:
 
 
 @lru_cache(maxsize=64)
-def _read_file_bytes(filename: str) -> bytes:
+def _read_file_bytes_cached(filename: str, mtime_ns: int, size: int) -> bytes:
     with open(filename, "rb") as fh:
         return fh.read()
+
+
+def _read_file_bytes(filename: str) -> bytes:
+    # Keyed on (mtime, size) so an edited-and-recompiled file is re-read — a
+    # filename-only cache would splice new byte offsets into stale bytes.
+    st = os.stat(filename)
+    return _read_file_bytes_cached(filename, st.st_mtime_ns, st.st_size)
 
 
 @dataclass(frozen=True)

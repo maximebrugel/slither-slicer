@@ -35,9 +35,10 @@ def _crit(node, var, origin: str) -> SliceCriterion:
 def find_sources(contract: Contract) -> list[SliceCriterion]:
     """Return every forward-slice criterion seeded by a source in ``contract``."""
     crits: list[SliceCriterion] = []
-    seen: set[tuple[int, int]] = set()
 
-    for func in contract.functions_and_modifiers_declared:
+    # Inherited-inclusive: a source read in a base contract is live code of the
+    # derived contract — scanning only declared functions would hide it.
+    for func in contract.functions_and_modifiers:
         # External input: parameters of public/external functions.
         if func.visibility in _ENTRY_VISIBILITY:
             entry = func.entry_point or (func.nodes[0] if func.nodes else None)
@@ -45,20 +46,22 @@ def find_sources(contract: Contract) -> list[SliceCriterion]:
                 for param in func.parameters:
                     crits.append(_crit(entry, param, "source:parameter"))
 
+        # One criterion per (function, composed var), seeded at the first node
+        # that reads it: seed resolution collects *every* occurrence of a
+        # composed variable in the function, so per-node criteria would just be
+        # near-identical slices of the same taint.
+        seen_composed: set[str] = set()
         for node in func.nodes:
             for op in node.irs_ssa:
                 # Caller identity / call value / environment.
                 for var in op.read:
+                    name = str(var)
                     is_src = isinstance(var, SolidityVariableComposed) and (
-                        str(var) in _SOURCE_SOLIDITY_VARS
+                        name in _SOURCE_SOLIDITY_VARS
                     )
-                    if is_src:
-                        key = (id(node), id(var))
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        origin = _origin_for(str(var))
-                        crits.append(_crit(node, var, origin))
+                    if is_src and name not in seen_composed:
+                        seen_composed.add(name)
+                        crits.append(_crit(node, var, _origin_for(name)))
                 # Return values of *true external* calls are untrusted (oracle-ish);
                 # library returns are our own trusted code, so they are excluded.
                 if (
