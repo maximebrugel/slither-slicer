@@ -44,6 +44,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--json", metavar="PATH", help="write JSON output to PATH (else stdout)")
     p.add_argument("--source", action="store_true", help="print reconstructed source too")
+    p.add_argument(
+        "--max-nodes",
+        type=int,
+        default=None,
+        help="cap nodes per slice in JSON output (guards always kept; adds a "
+        "truncated:<kept>-of-<total>-nodes note)",
+    )
     return p
 
 
@@ -64,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         slices = []
         for spec in _guarded_functions(sl, args.access_control):
             slices.append(sl.access_control_of(spec))
-        _emit(slices_to_json_str(slices), args.json)
+        _emit(slices_to_json_str(slices, max_nodes=args.max_nodes), args.json)
         print(f"# {len(slices)} guard slice(s)", file=sys.stderr)
         if args.source:
             for s in slices:
@@ -73,13 +80,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.sinks:
         slices = sl.slice_all_sinks(contract=args.contract)
-        _emit(slices_to_json_str(slices), args.json)
+        _emit(slices_to_json_str(slices, max_nodes=args.max_nodes), args.json)
         print(f"# {len(slices)} sink slice(s)", file=sys.stderr)
         return 0
 
     if args.sources:
         slices = sl.slice_all_sources(contract=args.contract)
-        _emit(slices_to_json_str(slices), args.json)
+        _emit(slices_to_json_str(slices, max_nodes=args.max_nodes), args.json)
         print(f"# {len(slices)} source slice(s)", file=sys.stderr)
         return 0
 
@@ -88,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
             s = sl.forward_slice(function=args.function, variable=args.var, depth=args.depth)
         else:
             s = sl.backward_slice(function=args.function, variable=args.var, depth=args.depth)
-        _emit(to_json_str(s), args.json)
+        _emit(to_json_str(s, max_nodes=args.max_nodes), args.json)
         if args.source:
             print(s.to_source())
         return 0

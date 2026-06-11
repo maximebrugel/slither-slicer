@@ -62,6 +62,56 @@ def proxy() -> Slicer:
     return _slicer("Proxy.sol")
 
 
+@pytest.fixture(scope="session")
+def tokens() -> Slicer:
+    return _slicer("Tokens.sol")
+
+
+@pytest.fixture(scope="session")
+def cei_safe() -> Slicer:
+    return _slicer("CEISafe.sol")
+
+
+@pytest.fixture(scope="session")
+def storage_stitch() -> Slicer:
+    return _slicer("StorageStitch.sol")
+
+
+@pytest.fixture(scope="session")
+def cross_contract() -> Slicer:
+    return _slicer("CrossContract.sol")
+
+
+@pytest.fixture(scope="session")
+def custom_errors() -> Slicer:
+    return _slicer("CustomErrors.sol")
+
+
+@pytest.fixture(scope="session")
+def try_catch() -> Slicer:
+    return _slicer("TryCatch.sol")
+
+
+@pytest.fixture(scope="session")
+def structs() -> Slicer:
+    return _slicer("Structs.sol")
+
+
+@pytest.fixture(scope="session")
+def loops() -> Slicer:
+    return _slicer("Loops.sol")
+
+
+@pytest.fixture(scope="session")
+def fallback_receive() -> Slicer:
+    return _slicer("FallbackReceive.sol")
+
+
+@pytest.fixture(scope="session")
+def multi_inherit() -> Slicer:
+    return _slicer("MultiInherit.sol")
+
+
 def node_set(sl) -> set[tuple[str, str]]:
     """(node_id, reason) pairs for a slice."""
     return {(n.node_id, n.reason) for n in sl.nodes}

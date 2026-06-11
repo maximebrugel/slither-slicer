@@ -9,10 +9,11 @@ flooding work the slicer exists to absorb. Raw-graph access lives in
 :mod:`slither_slicer.graph` and the CLI ``--pdg`` flag, for a human.
 
 Tools:
-  Orientation : list_contracts, list_functions
+  Orientation : list_contracts, list_functions, audit_overview
   Catalog     : slice_all_sinks, slice_all_sources   (compact — drill in with slice_from)
   Full slices : access_control_of, slice_from
   Call graph  : find_callers, find_callees
+  Storage     : state_var_xref                       (readers/writers of a state var)
   Explorer    : explain_dependence                   (one bounded path query)
 
 Project selection: an explicit ``project`` arg, else the ``SLITHER_SLICER_PROJECT``
@@ -105,8 +106,10 @@ def _summarize(s: Slice) -> dict:
         "location": _location(crit.node),
         "criterion_node_id": g.global_node_id(crit.node),
         "guarded": s.guarded,
+        "state_write_after_external_call": s.state_write_after_external_call,
         "node_count": len(s.nodes),
         "state_vars_written": s.state_vars_written,
+        "storage_writers": sorted({w["state_var"] for w in s.storage_writers}),
         "external_calls": s.external_calls,
         "call_kinds": sorted({c["kind"] for c in s.calls}),
         "events_emitted": [e["name"] for e in s.events_emitted],
@@ -164,6 +167,12 @@ def _mutability(f) -> str:
     return "nonpayable"
 
 
+def audit_overview_impl(contract: str, project: str | None = None) -> dict:
+    sl = _get_slicer(project)
+    c = sl._contract(contract)
+    return {"contract": c.name, "entry_points": sl.audit_overview(contract=c.name)}
+
+
 def slice_all_sinks_impl(contract: str, project: str | None = None) -> dict:
     sl = _get_slicer(project)
     c = sl._contract(contract)
@@ -190,6 +199,9 @@ def slice_from_impl(
     project: str | None = None,
     node_id: str | None = None,
     depth: int = 1,
+    max_nodes: int | None = None,
+    storage_depth: int = 0,
+    cross_contract: bool = False,
 ) -> dict:
     sl = _get_slicer(project)
     d = direction.lower()
@@ -200,12 +212,36 @@ def slice_from_impl(
         # `criterion_node_id` names the precise sink/source node (a whole-node
         # criterion like a delegatecall has no variable to slice by).
         dirn = Direction.BACKWARD if d == "backward" else Direction.FORWARD
-        return sl.slice_at_node(node_id, variable=variable, direction=dirn, depth=depth).to_json()
+        sl_obj = sl.slice_at_node(
+            node_id,
+            variable=variable,
+            direction=dirn,
+            depth=depth,
+            storage_depth=storage_depth,
+            cross_contract=cross_contract,
+        )
+        return sl_obj.to_json(max_nodes=max_nodes)
     if function is None:
         raise ValueError("pass `function` (with optional `variable`) or `node_id`")
     if d == "backward":
-        return sl.backward_slice(function=function, variable=variable, depth=depth).to_json()
-    return sl.forward_slice(function=function, variable=variable, depth=depth).to_json()
+        sl_obj = sl.backward_slice(
+            function=function,
+            variable=variable,
+            depth=depth,
+            storage_depth=storage_depth,
+            cross_contract=cross_contract,
+        )
+    else:
+        sl_obj = sl.forward_slice(
+            function=function, variable=variable, depth=depth, cross_contract=cross_contract
+        )
+    return sl_obj.to_json(max_nodes=max_nodes)
+
+
+def state_var_xref_impl(contract: str, variable: str, project: str | None = None) -> dict:
+    sl = _get_slicer(project)
+    c = sl._contract(contract)
+    return sl.state_var_xref(contract=c.name, variable=variable)
 
 
 def find_callers_impl(function: str, project: str | None = None) -> dict:
@@ -248,34 +284,38 @@ def find_callees_impl(function: str, project: str | None = None) -> dict:
 
 
 def explain_dependence_impl(
-    node_a_id: str, node_b_id: str, project: str | None = None
+    node_a_id: str, node_b_id: str, project: str | None = None, depth: int = 2
 ) -> dict:
     """Is ``node_b`` reachable from ``node_a`` over the PDG (does B influence A),
-    and by what path? One bounded path — not the neighbourhood."""
+    and by what path? One bounded path — not the neighbourhood. Crosses function
+    boundaries (call descent / ascent and shared storage) up to ``depth``
+    crossings; same-function queries use the precise intra-function PDG."""
     sl = _get_slicer(project)
-    func_a = node_a_id.rpartition("#")[0]
-    func_b = node_b_id.rpartition("#")[0]
-    if func_a != func_b:
-        return {
-            "connected": False,
-            "path": [],
-            "note": (
-                "cross-function dependence is not traversed here (v1). Both nodes "
-                "must belong to the same function; use slice_from for inter-"
-                "procedural reach."
-            ),
-        }
     node_a = _resolve_node(sl, node_a_id)
     node_b = _resolve_node(sl, node_b_id)
-    function = node_a.function
 
-    forward = g.find_path(function, node_a, node_b)
+    if node_a.function is node_b.function:
+        function = node_a.function
+        forward = g.find_path(function, node_a, node_b)
+        if forward is not None:
+            return _path_result(forward, f"{node_b_id} influences {node_a_id}")
+        backward = g.find_path(function, node_b, node_a)
+        if backward is not None:
+            return _path_result(backward, f"{node_a_id} influences {node_b_id}")
+        return {"connected": False, "path": [], "note": "no dependence path in either direction"}
+
+    contract = sl._contract(node_a_id.split(".", 1)[0])
+    forward = g.find_path_interproc(contract, node_a, node_b, depth=depth)
     if forward is not None:
         return _path_result(forward, f"{node_b_id} influences {node_a_id}")
-    backward = g.find_path(function, node_b, node_a)
+    backward = g.find_path_interproc(contract, node_b, node_a, depth=depth)
     if backward is not None:
         return _path_result(backward, f"{node_a_id} influences {node_b_id}")
-    return {"connected": False, "path": [], "note": "no dependence path in either direction"}
+    return {
+        "connected": False,
+        "path": [],
+        "note": f"no dependence path within depth={depth} crossings",
+    }
 
 
 def _resolve_node(sl: Slicer, node_id: str) -> Node:
@@ -307,6 +347,17 @@ def list_functions(contract: str, project: str | None = None) -> dict:
     """List a contract's functions with visibility, modifiers and mutability —
     use this to find a function/variable to slice."""
     return list_functions_impl(contract, project)
+
+
+@mcp.tool()
+def audit_overview(contract: str, project: str | None = None) -> dict:
+    """The attack surface of a contract in one call — the first move in an audit.
+    One row per external entry point with: visibility, mutability, whether the
+    caller is restricted (`guarded`), state it writes, whether it moves value,
+    its opaque external calls, token sinks, all reachable sink origins, and
+    `state_write_after_external_call` (the checks-effects-interactions / reentrancy
+    ordering flag). Drill into any row with `slice_all_sinks` / `slice_from`."""
+    return audit_overview_impl(contract, project)
 
 
 @mcp.tool()
@@ -342,6 +393,9 @@ def slice_from(
     project: str | None = None,
     node_id: str | None = None,
     depth: int = 1,
+    max_nodes: int | None = None,
+    storage_depth: int = 0,
+    cross_contract: bool = False,
 ) -> dict:
     """Deterministic program slice from an agent-chosen criterion. Either pass
     `node_id` (a node id from a slice or catalog summary's `criterion_node_id`,
@@ -349,9 +403,35 @@ def slice_from(
     `function` (like 'Vault.withdraw()') with an optional `variable` name in it.
     `direction` is 'backward' (what influences it) or 'forward' (what it
     influences); `depth` is how many call boundaries to cross (default 1).
-    Returns the full slice with byte-accurate source for every node,
-    control/data/modifier-guard reasons, touched state and external calls."""
-    return slice_from_impl(function, variable, direction, project, node_id, depth)
+    `storage_depth` (backward only, default 0=off) pulls cross-function writers of
+    the state vars the slice reads, tagged `storage-dep` and listed in
+    `storage_writers`. `cross_contract` (default off) descends into another
+    in-scope contract when an external call's destination type resolves to exactly
+    one concrete contract, adding a `cross-contract:<Callee>` note (the runtime
+    address may differ — proxies stay opaque). `max_nodes` caps the returned node
+    body for a large slice (guards are always kept; a `truncated:<kept>-of-<total>-
+    nodes` note is added). Returns the slice with byte-accurate source for every
+    node, control/data/modifier-guard reasons, touched state and external calls."""
+    return slice_from_impl(
+        function,
+        variable,
+        direction,
+        project,
+        node_id,
+        depth,
+        max_nodes,
+        storage_depth,
+        cross_contract,
+    )
+
+
+@mcp.tool()
+def state_var_xref(contract: str, variable: str, project: str | None = None) -> dict:
+    """Readers and writers of a contract state variable, each with location,
+    node_id, `guarded` status and entry-point reachability — the cheap way to see
+    who touches storage X. To pull this dataflow *into* a slice, use `slice_from`
+    with `storage_depth=1`. e.g. contract='Vault', variable='balances'."""
+    return state_var_xref_impl(contract, variable, project)
 
 
 @mcp.tool()
@@ -367,11 +447,15 @@ def find_callees(function: str, project: str | None = None) -> dict:
 
 
 @mcp.tool()
-def explain_dependence(node_a_id: str, node_b_id: str, project: str | None = None) -> dict:
+def explain_dependence(
+    node_a_id: str, node_b_id: str, project: str | None = None, depth: int = 2
+) -> dict:
     """Are two slice nodes connected in the PDG, and by what path? Node ids look
     like 'Vault.withdraw()#5' (as returned in slice nodes). Returns one bounded
-    dependence path, or that they are unconnected. Same function only (v1)."""
-    return explain_dependence_impl(node_a_id, node_b_id, project)
+    dependence path, or that they are unconnected. Crosses function boundaries
+    (call descent/ascent and shared storage) up to `depth` crossings (default 2);
+    same-function queries use the precise intra-function PDG."""
+    return explain_dependence_impl(node_a_id, node_b_id, project, depth)
 
 
 def main() -> None:

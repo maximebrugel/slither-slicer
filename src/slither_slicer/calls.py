@@ -27,9 +27,45 @@ if TYPE_CHECKING:
 # into. Everything else is in-scope.
 OPAQUE_KINDS = frozenset({"external", "delegatecall", "low_level"})
 
+# ERC20/721 value-movement methods -> token-sink origin. Matched on the *called
+# function's name* so a SafeERC20 library wrapper (``token.safeTransfer(...)``,
+# which we descend into rather than treat as opaque) is recognised as value
+# movement at the calling contract exactly like a raw ``token.transfer(...)``.
+# This is a name heuristic: only consulted for contract/interface calls
+# (HighLevelCall / LibraryCall), never internal calls.
+TOKEN_SINK_ORIGINS = {
+    "transfer": "sink:token_transfer",
+    "transferFrom": "sink:token_transfer",
+    "safeTransfer": "sink:token_transfer",
+    "safeTransferFrom": "sink:token_transfer",
+    "approve": "sink:token_approval",
+    "safeApprove": "sink:token_approval",
+    "increaseAllowance": "sink:token_approval",
+    "decreaseAllowance": "sink:token_approval",
+    "safeIncreaseAllowance": "sink:token_approval",
+    "safeDecreaseAllowance": "sink:token_approval",
+    "mint": "sink:token_supply",
+    "burn": "sink:token_supply",
+    "burnFrom": "sink:token_supply",
+}
+
 
 def is_opaque_kind(kind: str) -> bool:
     return kind in OPAQUE_KINDS
+
+
+def token_sink_origin(op: Operation) -> str | None:
+    """Token-flow sink origin for a call ``op``, or ``None``.
+
+    Matched by the called function's name; the caller restricts this to
+    contract/interface calls so an in-scope helper named ``transfer`` is not
+    mistaken for an ERC20 movement.
+    """
+    func = getattr(op, "function", None)
+    name = getattr(func, "name", None) if func is not None else None
+    if name is None:
+        return None
+    return TOKEN_SINK_ORIGINS.get(name)
 
 
 def _location(node: Node) -> str:
@@ -65,6 +101,18 @@ def classify_call(op: Operation, node: Node) -> dict | None:
     else:
         return None
 
+    # Cheap static annotation (always on): if an external call's destination type
+    # resolves to exactly one concrete in-scope contract, name it. This is a fact,
+    # not a descent — it gives the agent "this external call resolves to X.f"
+    # without the assumption-laden cross-contract traversal (opt-in on the slicer).
+    resolved_target = None
+    if kind == "external":
+        from .interproc import resolve_high_level_target
+
+        resolved, _why = resolve_high_level_target(op)
+        if resolved is not None:
+            resolved_target = resolved.canonical_name
+
     expr = str(op.expression) if getattr(op, "expression", None) is not None else str(op)
     return {
         "expr": expr,
@@ -72,4 +120,5 @@ def classify_call(op: Operation, node: Node) -> dict | None:
         "target": target,
         "in_scope": in_scope,
         "location": _location(node),
+        "resolved_target": resolved_target,
     }

@@ -30,13 +30,18 @@ from .catalog.access import is_guarded
 from .catalog.sinks import _is_state_var
 from .criteria import Direction, SliceCriterion
 from .dependence.data import base_of_reference, imprecise_index, op_defs, op_reads
+from .dependence.storage import build_storage_xref
 from .interproc import (
     MAX_BOUNDARY_CROSSINGS,
+    MAX_CROSS_CONTRACT_CROSSINGS,
     actual_to_formal,
     callsites_of,
+    is_cross_contract_call,
     is_descendable_call,
+    resolve_high_level_target,
 )
 from .model import Slice, SliceNode, SourceRef
+from .patterns import state_write_after_external_call
 from .pdg import build_pdg
 
 if TYPE_CHECKING:
@@ -44,13 +49,19 @@ if TYPE_CHECKING:
     from slither.core.declarations import Contract, Function
 
 # Reason priority — when a node is reached more than once, the strongest wins.
+# ``storage-dep`` is the weakest: a cross-function shared-state link is looser
+# than an in-function SSA data dependence, so a writer node that is already in
+# the slice for a stronger reason keeps that reason.
 _REASON_RANK = {
-    "criterion": 5,
-    "modifier-guard": 4,
-    "control-dep": 3,
-    "callee": 2,
-    "data-dep": 1,
+    "criterion": 6,
+    "modifier-guard": 5,
+    "control-dep": 4,
+    "callee": 3,
+    "data-dep": 2,
+    "storage-dep": 1,
 }
+
+_ENTRY_VISIBILITY = ("public", "external")
 
 # Node types that are pure CFG scaffolding, never emitted as slice statements.
 _SCAFFOLDING = (NodeType.ENTRYPOINT, NodeType.PLACEHOLDER)
@@ -70,14 +81,28 @@ def _matches(ssa_var, target) -> bool:
 
 
 class _Slicer:
-    def __init__(self, contract: Contract, depth: int = MAX_BOUNDARY_CROSSINGS):
+    def __init__(
+        self,
+        contract: Contract,
+        depth: int = MAX_BOUNDARY_CROSSINGS,
+        storage_depth: int = 0,
+        cross_contract: bool = False,
+        xcontract_depth: int = MAX_CROSS_CONTRACT_CROSSINGS,
+    ):
         self.contract = contract
         self.depth = depth  # call-boundary crossings allowed per trace
+        self.storage_depth = storage_depth  # rounds of state-writer stitching (0 = off)
+        self.cross_contract = cross_contract  # descend into other in-scope contracts
+        self.xcontract_depth = xcontract_depth  # cross-contract boundaries allowed
+        self._xc_used = 0  # cross-contract descents performed (slice-global budget)
+        self._xc_seen: set[int] = set()  # id(op) of HighLevelCalls already handled
         self.included: dict[Node, str] = {}  # node -> reason
         self.notes: list[str] = []
         self.external_calls: list[str] = []
         self.calls: list[dict] = []
         self.events_emitted: list[dict] = []
+        self.storage_writers: list[dict] = []  # cross-function writers stitched in
+        self._storage_pulled: set[str] = set()  # state vars already stitched (once each)
         # id(ssa_var) -> lowest crossings it was processed at. A var first seen
         # deep in a call chain (high crossings, little budget left) must still be
         # reprocessed if reached again nearer the criterion.
@@ -149,7 +174,96 @@ class _Slicer:
         self._saturate_backward()
         self._include_modifier_guards(func)
         self._saturate_backward()
+        # Cross-contract descent (opt-in): peer into resolvable external callees.
+        if self.cross_contract:
+            while self._cross_contract_backward_step():
+                self._saturate_backward()
+        # Storage stitching (opt-in): pull cross-function writers of the state
+        # vars this slice reads, then re-saturate so each writer's own guards and
+        # data deps come along — a pulled writer is not left dangling.
+        for _ in range(self.storage_depth):
+            if not self._storage_closure_step():
+                break
+            self._saturate_backward()
         return self._finish(criterion)
+
+    def _cross_contract_backward_step(self) -> bool:
+        """For every included node holding an unresolved external call, resolve it
+        to a unique in-scope contract and pull that callee's RETURN and state-write
+        nodes (seeding their reads). Bounded by ``xcontract_depth`` (a slice-global
+        ``_xc_used`` counter) and ``_xc_seen`` (per-call idempotence) → terminates.
+        Resolution failures are recorded as notes, never silently dropped."""
+        added = False
+        for node in list(self.included):
+            for op in node.irs_ssa:
+                if not is_cross_contract_call(op) or id(op) in self._xc_seen:
+                    continue
+                if self._xc_used >= self.xcontract_depth:
+                    self._note("cross-contract-depth-limit")
+                    continue
+                callee, why = resolve_high_level_target(op)
+                self._xc_seen.add(id(op))
+                if callee is None:
+                    if why is not None:
+                        self._note(why)
+                    continue
+                self._xc_used += 1
+                self._note(f"cross-contract:{callee.canonical_name}")
+                if self._pull_callee_backward(callee):
+                    added = True
+        return added
+
+    def _pull_callee_backward(self, callee: Function) -> bool:
+        """Add a (cross-contract) callee's RETURN and state-write nodes and seed
+        their reads — the callee body that flows to the call's result / storage."""
+        added = False
+        for n in callee.nodes:
+            if n.type in _SCAFFOLDING:
+                continue
+            for cop in n.irs_ssa:
+                lv = getattr(cop, "lvalue", None)
+                is_state_write = lv is not None and _is_state_var(base_of_reference(lv))
+                if n.type == NodeType.RETURN or is_state_write:
+                    self._add_node(n, "callee")
+                    added = True
+                    for r in op_reads(cop):
+                        self._push(r, callee, 0)
+        return added
+
+    def _storage_closure_step(self) -> bool:
+        """One round of storage stitching: for every included node that reads a
+        state var not yet stitched, pull that var's writer sites elsewhere in the
+        contract as ``storage-dep`` and seed their reads. Each state var is
+        stitched at most once (``_storage_pulled``), so this terminates regardless
+        of ``storage_depth``. Backward only — a writer of a var the criterion
+        *reads* is upstream influence; forward slicing already taints into writers
+        through ordinary def-use."""
+        added = False
+        xref = build_storage_xref(self.contract)
+        for node in list(self.included):
+            for sv in node.state_variables_read:
+                name = sv.canonical_name
+                if name in self._storage_pulled:
+                    continue
+                self._storage_pulled.add(name)
+                for wfn, wnode in xref.writers.get(name, []):
+                    if wnode is node or wnode.type in _SCAFFOLDING or wnode in self.included:
+                        continue
+                    self._add_node(wnode, "storage-dep")
+                    self.storage_writers.append(
+                        {
+                            "state_var": str(sv),
+                            "function": wfn.canonical_name,
+                            "node_id": f"{wfn.canonical_name}#{wnode.node_id}",
+                            "guarded": is_guarded(wfn),
+                            "is_entry_point": wfn.visibility in _ENTRY_VISIBILITY,
+                        }
+                    )
+                    added = True
+                    for op in wnode.irs_ssa:
+                        for r in op_reads(op):
+                            self._push(r, wfn, 0)
+        return added
 
     def _saturate_backward(self) -> None:
         while True:
@@ -203,6 +317,11 @@ class _Slicer:
         idx = function.parameters.index(target)
         for _caller, node, op in callsites_of(self.contract, function):
             self._add_node(node, "callee")
+            # The caller may carry the access-control guard that protects this
+            # whole call chain (a privileged write in an internal helper is
+            # guarded by its entry point's modifier). Pull those guards so they
+            # are visible in the slice rather than silently absent.
+            self._include_modifier_guards(node.function)
             if idx < len(op.arguments):
                 self._push(op.arguments[idx], node.function, crossings + 1)
 
@@ -259,6 +378,8 @@ class _Slicer:
                     self._add_node(unode, "callee" if crossings > 0 else "data-dep")
                 if is_descendable_call(uop):
                     self._descend_forward(uop, var, crossings)
+                elif self.cross_contract and is_cross_contract_call(uop):
+                    self._descend_cross_contract_forward(uop, var)
                 for d in op_defs(uop):
                     self._push(d, function, crossings)
 
@@ -280,6 +401,34 @@ class _Slicer:
                         if getattr(v, "non_ssa_version", None) is formal and id(v) not in seeded:
                             seeded.add(id(v))
                             self._push(v, callee, crossings + 1)
+
+    def _descend_cross_contract_forward(self, op, tainted_actual) -> None:
+        """Taint flows into a cross-contract call argument: resolve the callee and
+        seed the matching formal parameter inside it. Mirrors ``_descend_forward``
+        but across a contract boundary, bounded by the cross-contract budget."""
+        if id(op) in self._xc_seen:
+            return
+        if self._xc_used >= self.xcontract_depth:
+            self._note("cross-contract-depth-limit")
+            return
+        callee, why = resolve_high_level_target(op)
+        self._xc_seen.add(id(op))
+        if callee is None:
+            if why is not None:
+                self._note(why)
+            return
+        self._xc_used += 1
+        self._note(f"cross-contract:{callee.canonical_name}")
+        seeded: set[int] = set()
+        for actual, formal in actual_to_formal(op, callee):
+            if str(actual) != str(tainted_actual):
+                continue
+            for n in callee.nodes:
+                for cop in n.irs_ssa:
+                    for v in op_reads(cop) + op_defs(cop):
+                        if getattr(v, "non_ssa_version", None) is formal and id(v) not in seeded:
+                            seeded.add(id(v))
+                            self._push(v, callee, 0)
 
     def _forward_control(self, criterion_node: Node) -> None:
         pdg = build_pdg(criterion_node.function)
@@ -416,6 +565,10 @@ class _Slicer:
             external_calls=list(self.external_calls),
             calls=list(self.calls),
             guarded=is_guarded(criterion.node.function),
+            state_write_after_external_call=state_write_after_external_call(
+                criterion.node.function
+            ),
+            storage_writers=list(self.storage_writers),
             events_emitted=list(self.events_emitted),
             entry_points=self._entry_points_reaching(criterion.node.function),
             notes=list(self.notes),
@@ -436,12 +589,21 @@ class _Slicer:
 
 
 def backward_slice(
-    contract: Contract, criterion: SliceCriterion, depth: int = MAX_BOUNDARY_CROSSINGS
+    contract: Contract,
+    criterion: SliceCriterion,
+    depth: int = MAX_BOUNDARY_CROSSINGS,
+    storage_depth: int = 0,
+    cross_contract: bool = False,
 ) -> Slice:
-    return _Slicer(contract, depth=depth).backward(criterion)
+    return _Slicer(
+        contract, depth=depth, storage_depth=storage_depth, cross_contract=cross_contract
+    ).backward(criterion)
 
 
 def forward_slice(
-    contract: Contract, criterion: SliceCriterion, depth: int = MAX_BOUNDARY_CROSSINGS
+    contract: Contract,
+    criterion: SliceCriterion,
+    depth: int = MAX_BOUNDARY_CROSSINGS,
+    cross_contract: bool = False,
 ) -> Slice:
-    return _Slicer(contract, depth=depth).forward(criterion)
+    return _Slicer(contract, depth=depth, cross_contract=cross_contract).forward(criterion)

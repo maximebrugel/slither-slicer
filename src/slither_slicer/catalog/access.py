@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from slither.core.cfg.node import NodeType
 from slither.core.declarations import SolidityVariableComposed
 from slither.slithir.operations import (
     Binary,
@@ -39,19 +40,39 @@ _CALLER_VARS = {"msg.sender", "tx.origin"}
 
 _IDENTITY_COMPARISONS = (BinaryType.EQUAL, BinaryType.NOT_EQUAL)
 
+# Reverting builtins, including a custom-error revert (``revert MyError()`` lowers
+# to a SolidityCall named ``"revert <Sig>"``).
+_ABORT_PREFIXES = ("require(", "assert(", "revert(", "revert ")
+
 
 def _is_caller_var(v) -> bool:
     return isinstance(v, SolidityVariableComposed) and str(v) in _CALLER_VARS
 
 
+def _node_aborts(node: Node) -> bool:
+    """True if executing ``node`` reverts/throws — a ``require``/``assert``/``revert``
+    (custom errors included) or a ``THROW`` node. Used to recognise an
+    ``if (caller-check) revert`` guard, the modern equivalent of an inline
+    ``require``."""
+    if node.type == NodeType.THROW:
+        return True
+    return any(
+        isinstance(op, SolidityCall) and op.function.name.startswith(_ABORT_PREFIXES)
+        for op in node.irs_ssa
+    )
+
+
 def is_caller_check(node: Node) -> bool:
-    """True if ``node`` is a ``require``/``assert`` whose condition checks the
-    caller's *identity* (see module docstring) — not one that merely reads it."""
+    """True if ``node`` checks the caller's *identity* (see module docstring) — not
+    one that merely reads it. Two shapes count: a ``require``/``assert`` with a
+    caller-identity condition, or an ``if (caller-identity) revert``/``throw``
+    (covering custom-error reverts, which carry no ``require``)."""
     has_require = any(
         isinstance(op, SolidityCall) and op.function.name.startswith(("require(", "assert("))
         for op in node.irs_ssa
     )
-    if not has_require:
+    guards_revert = node.type == NodeType.IF and any(_node_aborts(s) for s in node.sons)
+    if not (has_require or guards_revert):
         return False
     for op in node.irs_ssa:
         # msg.sender == owner / msg.sender != attacker

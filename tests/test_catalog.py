@@ -35,6 +35,36 @@ def test_sources_detected(access_control):
     assert "source:call_value" in origins  # msg.value
 
 
+def test_token_transfer_sinks_detected(tokens):
+    c = tokens._contract("Vault")
+    by_fn = {(s.function_name, s.origin) for s in find_sinks(c)}
+    assert ("Vault.pay(address,uint256)", "sink:token_transfer") in by_fn
+    assert ("Vault.pull(address,uint256)", "sink:token_transfer") in by_fn
+    assert ("Vault.allow(address,uint256)", "sink:token_approval") in by_fn
+
+
+def test_safe_erc20_library_transfer_is_a_token_sink(tokens):
+    """A SafeERC20 ``safeTransfer`` is a *library* call we descend into, but the
+    value movement must still surface as a token sink at the caller."""
+    c = tokens._contract("Vault")
+    token_sinks = [s for s in find_sinks(c) if s.function_name == "Vault.safePay(address,uint256)"]
+    assert any(s.origin == "sink:token_transfer" for s in token_sinks)
+
+
+def test_token_sink_slice_is_whole_node_drillable(tokens):
+    """Token sinks are whole-node criteria (no variable) so they drill in by
+    node id and the backward slice carries recipient + amount."""
+    s = next(
+        x
+        for x in tokens.slice_all_sinks("Vault")
+        if x.criterion.origin == "sink:token_transfer"
+        and x.criterion.function_name == "Vault.pay(address,uint256)"
+    )
+    assert s.criterion.variable_name is None
+    assert s.nodes  # non-empty slice
+    assert "token.transfer(to,amount)" in s.to_source().replace(" ", "")
+
+
 def test_selfdestruct_sink():
     from pathlib import Path
 

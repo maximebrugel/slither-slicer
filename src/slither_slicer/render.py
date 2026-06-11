@@ -14,16 +14,16 @@ if TYPE_CHECKING:
     from .model import Slice
 
 
-def to_json_str(sl: Slice, indent: int = 2) -> str:
-    return json.dumps(sl.to_json(), indent=indent)
+def to_json_str(sl: Slice, indent: int = 2, max_nodes: int | None = None) -> str:
+    return json.dumps(sl.to_json(max_nodes=max_nodes), indent=indent)
 
 
-def slices_to_json(slices: list[Slice]) -> list[dict]:
-    return [s.to_json() for s in slices]
+def slices_to_json(slices: list[Slice], max_nodes: int | None = None) -> list[dict]:
+    return [s.to_json(max_nodes=max_nodes) for s in slices]
 
 
-def slices_to_json_str(slices: list[Slice], indent: int = 2) -> str:
-    return json.dumps(slices_to_json(slices), indent=indent)
+def slices_to_json_str(slices: list[Slice], indent: int = 2, max_nodes: int | None = None) -> str:
+    return json.dumps(slices_to_json(slices, max_nodes=max_nodes), indent=indent)
 
 
 def to_source(sl: Slice) -> str:

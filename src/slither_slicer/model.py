@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 
     from .criteria import SliceCriterion
 
+# Reasons whose nodes are the audit payload — never dropped when budgeting a
+# slice down to `max_nodes`. Everything else (data-dep / callee / storage-dep) is
+# supporting context, filled in only while budget remains.
+_ALWAYS_KEEP_REASONS = ("criterion", "modifier-guard", "control-dep")
+
 
 @lru_cache(maxsize=64)
 def _read_file_bytes_cached(filename: str, mtime_ns: int, size: int) -> bytes:
@@ -98,6 +103,9 @@ class Slice:
     external_calls: list[str] = field(default_factory=list)  # opaque boundaries hit
     calls: list[dict] = field(default_factory=list)  # every call, classified (see calls.py)
     guarded: bool = False  # does the criterion's function restrict its caller?
+    state_write_after_external_call: bool = False  # CEI ordering risk (reentrancy shape)
+    # cross-function writers of state vars this slice reads (storage_depth > 0)
+    storage_writers: list[dict] = field(default_factory=list)
     events_emitted: list[dict] = field(default_factory=list)  # {name, location}
     entry_points: list[str] = field(default_factory=list)  # external fns reaching the criterion
     notes: list[str] = field(default_factory=list)  # limitations triggered
@@ -131,10 +139,22 @@ class Slice:
             out.append("")
         return "\n".join(out).rstrip() + "\n"
 
-    def to_json(self) -> dict:
+    def to_json(self, max_nodes: int | None = None) -> dict:
+        """Serialize the slice. ``max_nodes`` caps the node body for a token-
+        constrained agent: guards (criterion / modifier-guard / control-dep) are
+        *always* kept, the remaining budget is filled with data/callee/storage
+        nodes in source order, and a ``truncated:<kept>-of-<total>-nodes`` note is
+        appended. A guard is never dropped — even if guards alone exceed the cap."""
+        nodes = self.nodes
+        notes = self.notes
+        if max_nodes is not None and len(nodes) > max_nodes:
+            nodes, note = self._truncate_nodes(max_nodes)
+            notes = [*self.notes, note]
         return {
             "criterion": self.criterion.to_json(),
             "guarded": self.guarded,
+            "state_write_after_external_call": self.state_write_after_external_call,
+            "storage_writers": self.storage_writers,
             "functions_touched": self.functions_touched,
             "entry_points": self.entry_points,
             "state_vars_read": self.state_vars_read,
@@ -143,6 +163,17 @@ class Slice:
             "external_calls": self.external_calls,
             "calls": self.calls,
             "events_emitted": self.events_emitted,
-            "notes": self.notes,
-            "nodes": [n.to_json() for n in self.nodes],
+            "notes": notes,
+            "nodes": [n.to_json() for n in nodes],
         }
+
+    def _truncate_nodes(self, max_nodes: int) -> tuple[list[SliceNode], str]:
+        always = [n for n in self.nodes if n.reason in _ALWAYS_KEEP_REASONS]
+        fillable = [n for n in self.nodes if n.reason not in _ALWAYS_KEEP_REASONS]
+        if len(always) >= max_nodes:
+            kept = always  # guards exceed the budget — keep them all anyway
+        else:
+            kept = always + fillable[: max_nodes - len(always)]
+        kept_ids = {id(n) for n in kept}
+        ordered = [n for n in self.nodes if id(n) in kept_ids]  # restore source order
+        return ordered, f"truncated:{len(ordered)}-of-{len(self.nodes)}-nodes"

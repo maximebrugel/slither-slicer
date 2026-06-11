@@ -23,6 +23,8 @@ from typing import TYPE_CHECKING
 from slither.slithir.operations import Phi
 
 from .dependence.data import op_reads
+from .dependence.storage import build_storage_xref
+from .interproc import callsites_of, is_descendable_call
 from .pdg import build_pdg
 
 if TYPE_CHECKING:
@@ -31,6 +33,8 @@ if TYPE_CHECKING:
 
 DATA = "data-dep"
 CONTROL = "control-dep"
+CALLEE = "callee"
+STORAGE = "storage-dep"
 
 
 def global_node_id(node: Node) -> str:
@@ -161,3 +165,71 @@ def _reconstruct(src: Node, dst: Node, prev: dict) -> list[tuple[Node, str]]:
     chain.append((src, "seed"))
     chain.reverse()
     return chain
+
+
+def _node_reads_formal(node: Node) -> bool:
+    """True if ``node`` reads a formal parameter of its own function — the hook
+    for ascent (the value came from the caller's actual argument)."""
+    params = set(node.function.parameters)
+    for op in node.irs_ssa:
+        for v in op_reads(op):
+            if getattr(v, "non_ssa_version", None) in params:
+                return True
+    return False
+
+
+def _interproc_neighbors(contract: Contract, node: Node, crossings: int, depth: int):
+    """Dependence neighbours of ``node`` for interprocedural path finding:
+    intra-function data/control edges, plus call descent (into a callee's returns
+    / state writes), ascent (to a callee's callsites) and storage (to writers of a
+    state var the node reads). Inter-procedural edges cost one crossing and are
+    gated by ``depth``."""
+    pdg = build_pdg(node.function)
+    for target, kind in successors(pdg, node):
+        yield target, kind, crossings
+
+    if crossings >= depth:
+        return
+
+    # Descent: a resolvable call's result depends on the callee's returns / writes.
+    for op in node.irs_ssa:
+        if is_descendable_call(op) and op.function is not None:
+            for cn in op.function.nodes:
+                if cn.type.name == "RETURN" or cn.state_variables_written:
+                    yield cn, CALLEE, crossings + 1
+
+    # Ascent: a formal param read depends on the actuals at every callsite.
+    if _node_reads_formal(node):
+        for _caller, cnode, _op in callsites_of(contract, node.function):
+            yield cnode, CALLEE, crossings + 1
+
+    # Storage: a state var read depends on its writers across the contract.
+    xref = build_storage_xref(contract)
+    for sv in node.state_variables_read:
+        for _wfn, wnode in xref.writers.get(sv.canonical_name, []):
+            if wnode is not node:
+                yield wnode, STORAGE, crossings + 1
+
+
+def find_path_interproc(
+    contract: Contract, src: Node, dst: Node, depth: int = 2
+) -> list[tuple[Node, str]] | None:
+    """Shortest dependency path ``src -> ... -> dst`` across function boundaries
+    (call descent / ascent and shared storage), bounded by ``depth`` crossings, or
+    ``None`` if ``dst`` does not influence ``src`` within that budget."""
+    if src is dst:
+        return [(src, "seed")]
+    prev: dict[int, tuple[Node, str]] = {}
+    seen = {id(src)}
+    queue: deque[tuple[Node, int]] = deque([(src, 0)])
+    while queue:
+        cur, crossings = queue.popleft()
+        for target, kind, nx in _interproc_neighbors(contract, cur, crossings, depth):
+            if id(target) in seen:
+                continue
+            seen.add(id(target))
+            prev[id(target)] = (cur, kind)
+            if target is dst:
+                return _reconstruct(src, dst, prev)
+            queue.append((target, nx))
+    return None

@@ -17,6 +17,8 @@ FIXTURES = Path(__file__).parent / "fixtures"
 AC = str(FIXTURES / "AccessControl.sol")
 RE = str(FIXTURES / "Reentrancy.sol")
 IP = str(FIXTURES / "Interproc.sol")
+SS = str(FIXTURES / "StorageStitch.sol")
+XC = str(FIXTURES / "CrossContract.sol")
 
 
 def test_list_contracts():
@@ -40,6 +42,27 @@ def test_list_functions_shape():
     }
 
 
+def test_audit_overview_shape():
+    out = m.audit_overview_impl("Reentrancy", RE)
+    assert out["contract"] == "Reentrancy"
+    rows = {r["function"]: r for r in out["entry_points"]}
+    w = rows["Reentrancy.withdraw()"]
+    assert set(w) == {
+        "function",
+        "visibility",
+        "mutability",
+        "guarded",
+        "state_written",
+        "value_out",
+        "external_calls",
+        "token_sinks",
+        "sink_origins",
+        "state_write_after_external_call",
+    }
+    assert w["guarded"] is False
+    assert w["state_write_after_external_call"] is True
+
+
 def test_slice_all_sinks_is_compact_catalog():
     out = m.slice_all_sinks_impl("Reentrancy", RE)
     origins = {s["origin"] for s in out["sinks"]}
@@ -55,8 +78,10 @@ def test_slice_all_sinks_is_compact_catalog():
         "location",
         "criterion_node_id",
         "guarded",
+        "state_write_after_external_call",
         "node_count",
         "state_vars_written",
+        "storage_writers",
         "external_calls",
         "call_kinds",
         "events_emitted",
@@ -64,6 +89,42 @@ def test_slice_all_sinks_is_compact_catalog():
         "notes",
     }
     assert "nodes" not in sample
+
+
+def test_state_var_xref_impl():
+    out = m.state_var_xref_impl("StorageStitch", "balances", SS)
+    assert out["state_var"] == "balances"
+    writer_fns = {w["function"] for w in out["writers"]}
+    assert any(fn.endswith("deposit()") for fn in writer_fns)
+    assert any("slash" in fn for fn in writer_fns)
+
+
+def test_slice_from_storage_depth_pulls_writers():
+    blob = m.slice_from_impl(
+        node_id="StorageStitch.withdraw()#5", direction="backward", project=SS, storage_depth=1
+    )
+    writers = {w["function"] for w in blob["storage_writers"]}
+    assert any(fn.endswith("deposit()") for fn in writers)
+
+
+def test_slice_from_storage_depth_zero_is_baseline():
+    blob = m.slice_from_impl(
+        node_id="StorageStitch.withdraw()#5", direction="backward", project=SS, storage_depth=0
+    )
+    assert blob["storage_writers"] == []
+
+
+def test_slice_from_cross_contract_descends():
+    blob = m.slice_from_impl(
+        node_id="Vault.pull(address,uint256)#1", project=XC, cross_contract=True
+    )
+    assert any(n.startswith("cross-contract:Token.transfer") for n in blob["notes"])
+    assert "Token.transfer(address,uint256)" in blob["functions_touched"]
+
+
+def test_slice_from_cross_contract_off_by_default():
+    blob = m.slice_from_impl(node_id="Vault.pull(address,uint256)#1", project=XC)
+    assert not any(n.startswith("cross-contract:") for n in blob["notes"])
 
 
 def test_slice_all_sources_catalog():
@@ -121,12 +182,33 @@ def test_explain_dependence_connected_and_directional():
     assert out["path"][-1]["node_id"] == "Reentrancy.withdraw()#1"
 
 
-def test_explain_dependence_cross_function_noted():
+def test_explain_dependence_cross_function_ascent():
+    """A formal-param read in a callee is connected to the caller's callsite via
+    ascent — cross-function reach the v1 tool refused."""
     out = m.explain_dependence_impl(
-        "Interproc.withdraw(uint256)#1", "Interproc._transfer(address,uint256)#3", IP
+        "Interproc._transfer(address,uint256)#3", "Interproc.withdraw(uint256)#2", IP
+    )
+    assert out["connected"] is True
+    kinds = {p["edge_kind"] for p in out["path"]}
+    assert "callee" in kinds
+
+
+def test_explain_dependence_cross_function_storage():
+    """Two functions sharing a state variable are connected by a storage edge:
+    deposit writes `balances`, withdraw reads it."""
+    out = m.explain_dependence_impl(
+        "StorageStitch.withdraw()#1", "StorageStitch.deposit()#1", SS, depth=2
+    )
+    assert out["connected"] is True
+    assert any(p["edge_kind"] == "storage-dep" for p in out["path"])
+
+
+def test_explain_dependence_unconnected_within_depth():
+    out = m.explain_dependence_impl(
+        "StorageStitch.withdraw()#1", "StorageStitch.slash(address,uint256)#0", SS, depth=1
     )
     assert out["connected"] is False
-    assert "cross-function" in out["note"]
+    assert "depth=1" in out["note"]
 
 
 def test_missing_project_raises(monkeypatch):

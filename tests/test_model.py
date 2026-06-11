@@ -12,6 +12,8 @@ import json
 REQUIRED_TOP_LEVEL = {
     "criterion",
     "guarded",
+    "state_write_after_external_call",
+    "storage_writers",
     "functions_touched",
     "entry_points",
     "state_vars_read",
@@ -57,6 +59,44 @@ def test_source_ref_is_byte_accurate(reentrancy):
             raw = fh.read(src.length).decode("utf-8")
         assert raw == src.code
         assert src.lines  # 1-indexed line list is populated
+
+
+def _ether_sink(slicer, contract):
+    return next(
+        x
+        for x in slicer.slice_all_sinks(contract)
+        if x.criterion.origin == "sink:ether_transfer"
+    )
+
+
+def test_max_nodes_is_noop_when_unset(access_control):
+    s = _ether_sink(access_control, "AccessControl")
+    assert s.to_json() == s.to_json(max_nodes=None)
+    assert not any(n.startswith("truncated:") for n in s.to_json()["notes"])
+
+
+def test_max_nodes_truncates_supporting_node_and_notes(reentrancy):
+    """The reentrancy ether sink has 2 guards (control-dep + criterion) and one
+    supporting data-dep. max_nodes=2 drops the data-dep and keeps both guards."""
+    s = _ether_sink(reentrancy, "Reentrancy")
+    total = len(s.nodes)
+    blob = s.to_json(max_nodes=2)
+    assert len(blob["nodes"]) == 2
+    assert f"truncated:2-of-{total}-nodes" in blob["notes"]
+    reasons = {n["reason"] for n in blob["nodes"]}
+    assert "data-dep" not in reasons  # the supporting node was dropped
+    assert "criterion" in reasons
+
+
+def test_max_nodes_never_drops_a_guard(access_control):
+    """With max_nodes=1 the onlyOwner modifier guard must still survive — guards
+    are the audit payload, so the budget is exceeded rather than a guard dropped."""
+    s = _ether_sink(access_control, "AccessControl")
+    blob = s.to_json(max_nodes=1)
+    reasons = {n["reason"] for n in blob["nodes"]}
+    assert "modifier-guard" in reasons
+    assert len(blob["nodes"]) > 1  # guards alone exceed the cap
+    assert any(n.startswith("truncated:") for n in blob["notes"])
 
 
 def test_to_source_reconstruction(reentrancy):

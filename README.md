@@ -36,6 +36,9 @@ uv run slither-slicer path/to/project \
 
 # access-control guard slices for a contract
 uv run slither-slicer path/to/project --access-control Vault
+
+# cap nodes per slice for a large codebase (guards are always kept)
+uv run slither-slicer path/to/project --contract Vault --sinks --max-nodes 40
 ```
 
 ## Library
@@ -45,17 +48,22 @@ from slither_slicer import Slicer
 
 sl = Slicer("path/to/project")                       # compiles via crytic-compile
 
+overview = sl.audit_overview(contract="Vault")       # attack surface, one row/entry point
 slices = sl.slice_all_sinks(contract="Vault")        # list[Slice]
 slices = sl.slice_all_sources(contract="Vault")
 guards = sl.access_control_of("Vault.withdraw()")    # guard-context Slice
+xref = sl.state_var_xref("Vault", "balances")        # readers + writers of a state var
 
 s = sl.backward_slice(function="Vault.withdraw()", variable="amount")
 s = sl.forward_slice(function="Vault.deposit()", variable="msg.value")
 s = sl.slice_at_node("Vault.withdraw()#5")              # exact-node criterion
-# every slicing method takes depth=N (call boundaries to cross, default 1)
+# every slicing method takes depth=N (call boundaries to cross, default 1).
+# backward slices also take storage_depth=N (stitch cross-function state writers,
+# default 0=off) and cross_contract=True (descend into resolvable external callees).
 
-s.to_json()      # structured output (frozen schema — see below)
-s.to_source()    # minimal reconstructed source
+s.to_json()              # structured output (frozen schema — see below)
+s.to_json(max_nodes=40)  # cap the node body (guards always kept; adds a truncated: note)
+s.to_source()            # minimal reconstructed source
 ```
 
 ## MCP server (for Claude Code / agents)
@@ -96,12 +104,14 @@ slices never describe code that no longer exists. In a Claude Code session, run
 
 | tool | purpose |
 |---|---|
+| `audit_overview` | **the first move** — attack surface in one call: one row per entry point with guard status, value movement, external calls, sink origins, and the CEI ordering flag |
 | `list_contracts` / `list_functions` | orientation — bases and libraries included |
 | `slice_all_sinks` / `slice_all_sources` | **compact** catalog of sinks/sources — drill in with `slice_from(node_id=…)` |
 | `access_control_of` | full guard-context slice for a function |
-| `slice_from` | full slice from an agent-chosen criterion: a `node_id` from any slice/summary, or `(function, variable)`; `direction`, `depth` |
+| `slice_from` | full slice from an agent-chosen criterion: a `node_id` from any slice/summary, or `(function, variable)`; `direction`, `depth`, `storage_depth`, `cross_contract`, `max_nodes` |
+| `state_var_xref` | readers and writers of a state variable, each with location, guard status and entry-point reachability |
 | `find_callers` / `find_callees` | call-graph lookups |
-| `explain_dependence` | one bounded PDG path between two slice nodes |
+| `explain_dependence` | one bounded PDG path between two slice nodes — crosses call/storage boundaries up to `depth` |
 
 The raw PDG (for a human) is at `slither-slicer <project> --pdg "Vault.withdraw()"`.
 
@@ -118,6 +128,7 @@ source, never a paraphrase. Each node is tagged with **why** it was included:
 | `control-dep` | pulled by control dependence (an `if`/loop/`require` guard) |
 | `modifier-guard` | a modifier node guarding the enclosing function |
 | `callee` | reached by one level of inter-procedural descent/ascent |
+| `storage-dep` | a cross-function writer of a state var the slice reads (`storage_depth > 0`) |
 
 A slice also surfaces:
 
@@ -127,10 +138,19 @@ A slice also surfaces:
   boolean allowlist lookup, a checker call taking the caller). Merely *reading*
   the caller does not count: `nonReentrant` and
   `require(balances[msg.sender] >= amount)` restrict nothing about who may call.
-  An unguarded value/authority/state sink is the headline audit signal.
+  An unguarded value/authority/state sink is the headline audit signal. A guard
+  written the modern way — `if (msg.sender != owner) revert Unauthorized()`, with
+  no `require` — counts too.
+- `state_write_after_external_call` — the checks-effects-interactions ordering
+  risk behind reentrancy: a state write reachable *after* an external call.
 - `calls` — **every** call in the slice, classified: `library`/`internal` are
   in-scope (we descended into them), `external`/`delegatecall`/`low_level` are
-  opaque boundaries. `external_calls` is the opaque subset as strings.
+  opaque boundaries. Each carries `resolved_target` — the single concrete contract
+  an external call's destination type resolves to, if any (a static fact, surfaced
+  even without cross-contract descent). `external_calls` is the opaque subset as
+  strings.
+- `storage_writers` — when `storage_depth > 0`, the cross-function writers of the
+  state vars this slice reads, each with `guarded` / `is_entry_point` flags.
 - `events_emitted`, `entry_points` (external functions that reach the criterion),
   `state_vars_read`/`written` + `state_var_types`, `functions_touched`, `notes`.
 
@@ -170,10 +190,14 @@ retrieval tools. See `tests/test_model.py` for the asserted schema.
 - **Catalog** (`catalog/`) — Solidity-specific sink/source detectors that produce
   criteria automatically (ether transfers, external calls, `delegatecall`,
   `selfdestruct`, privileged state writes, arbitrary-call to an attacker-
-  controlled target; parameters, `msg.sender`/`tx.origin`, `msg.value`,
-  environment/oracle returns). Scanning is **inherited-inclusive**: a sink
-  declared in a base contract is live code of the derived contract, so it is
+  controlled target, ERC20/721 token movement — `transfer`/`approve`/`mint`/`burn`,
+  including SafeERC20 library wrappers; parameters, `msg.sender`/`tx.origin`,
+  `msg.value`, environment/oracle returns). Scanning is **inherited-inclusive**: a
+  sink declared in a base contract is live code of the derived contract, so it is
   cataloged there (and ascent climbs into base-declared callers).
+- **Triage** (`patterns.py`) — `audit_overview` gives the whole attack surface in
+  one call (entry points × guarded × value out × external calls × sink origins ×
+  CEI ordering), and the checks-effects-interactions flag rides on every slice.
 
 ## Known limitations (marked, never silently dropped)
 
@@ -184,16 +208,20 @@ going when it hits:
 - **`assembly { }` blocks** — slices stop at the boundary (`assembly-boundary:<fn>`).
 - **Imprecise aliasing** — mapping/array/struct writes through a non-constant
   index (`imprecise-alias:<base>`).
-- **Cross-function state effects** — v1 flags the state vars a slice touches but
-  does not stitch full state dataflow between functions (the agent layer does
-  that reasoning).
+- **Cross-function state effects** — *opt-in*: `storage_depth=N` stitches the
+  cross-function writers of state vars a slice reads (tagged `storage-dep`, listed
+  in `storage_writers`); `state_var_xref` lists readers/writers without a slice.
+  Off by default (the writers are surfaced as `state_vars_read`/`written`).
 - **Inter-procedural depth** — depth-limited (default one boundary; raise with
   `depth=`/`--depth`); calls beyond the limit are marked
   (`interproc-depth-limit:<fn>`).
 - **External / proxy / `delegatecall` boundaries** — calls to *other contracts*
-  are opaque; recorded in `external_calls` / `calls` (kind `external`/`low_level`/
-  `delegatecall`), not descended into. (In-scope **library** calls are *not*
-  boundaries — they are descended into.)
+  are opaque by default (recorded in `external_calls` / `calls`). *Opt-in*:
+  `cross_contract=True` descends when the destination type resolves to exactly one
+  concrete in-scope contract (note `cross-contract:<Callee>`; the runtime address
+  may differ, so proxies / multi-implementer interfaces stay opaque with a
+  `cross-contract-ambiguous`/`-unresolved` note). `delegatecall` is never
+  descended. In-scope **library** calls are never boundaries — they are descended.
 
 ## Tests
 

@@ -9,15 +9,20 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from slither.slithir.operations import InternalCall, LibraryCall
+from slither.core.declarations import Contract, Function
+from slither.core.solidity_types.user_defined_type import UserDefinedType
+from slither.slithir.operations import HighLevelCall, InternalCall, LibraryCall
 
 if TYPE_CHECKING:
     from slither.core.cfg.node import Node
-    from slither.core.declarations import Contract, Function
     from slither.slithir.operations import Operation
 
 # How many call boundaries a single trace may cross. v1 = 1.
 MAX_BOUNDARY_CROSSINGS = 1
+
+# Cross-contract descent is a separate, opt-in axis (different msg.sender, different
+# storage, runtime address may differ from the static type) — its own budget.
+MAX_CROSS_CONTRACT_CROSSINGS = 1
 
 
 def is_descendable_call(op: Operation) -> bool:
@@ -33,6 +38,64 @@ def is_descendable_call(op: Operation) -> bool:
     if isinstance(op, InternalCall):
         return not op.is_modifier_call and op.function is not None
     return False
+
+
+def is_cross_contract_call(op: Operation) -> bool:
+    """A call to another contract we *may* descend into when ``cross_contract`` is
+    enabled: a true external ``HighLevelCall`` (a ``LibraryCall`` is already
+    in-scope and handled by ``is_descendable_call``). ``delegatecall`` is a
+    ``LowLevelCall``, never a ``HighLevelCall``, so it is excluded here."""
+    return isinstance(op, HighLevelCall) and not isinstance(op, LibraryCall)
+
+
+def _implementers(decl: Contract, sig: str) -> list[Function]:
+    """Concrete, implemented functions matching ``sig`` on ``decl`` or any contract
+    that derives from it (the case where ``decl`` is an interface / abstract)."""
+    out: list[Function] = []
+    for c in [decl, *decl.derived_contracts]:
+        if c.is_interface or getattr(c, "is_abstract", False):
+            continue
+        fn = c.get_function_from_signature(sig)
+        if fn is not None and getattr(fn, "is_implemented", False):
+            out.append(fn)
+    return out
+
+
+def resolve_high_level_target(op: Operation) -> tuple[Function | None, str | None]:
+    """Resolve an external ``HighLevelCall`` to a single concrete in-scope callee,
+    or explain why it must stay opaque.
+
+    Returns ``(function, None)`` when the static destination type resolves to
+    exactly one implemented function, else ``(None, note)`` where ``note`` is the
+    reason suffix (``cross-contract-ambiguous`` / ``-no-impl`` / ``-unresolved``).
+    The runtime address may differ from the static type (proxies / injected
+    mocks) — this is a static over-approximation the caller records as a note.
+    """
+    callee = getattr(op, "function", None)
+    # Concrete case: op.function already names an implemented function on a real
+    # (non-interface) contract — Slither resolved it for us.
+    if (
+        isinstance(callee, Function)
+        and getattr(callee, "is_implemented", False)
+        and getattr(callee, "contract", None) is not None
+        and not callee.contract.is_interface
+    ):
+        return callee, None
+    # Interface case: op.function is the (unimplemented) interface stub. Resolve
+    # through the destination's declared type and its implementers.
+    if not isinstance(callee, Function):
+        return None, "cross-contract-unresolved"
+    dest = getattr(op, "destination", None)
+    dtype = getattr(dest, "type", None)
+    if not isinstance(dtype, UserDefinedType) or not isinstance(dtype.type, Contract):
+        return None, "cross-contract-unresolved"
+    decl = dtype.type
+    impls = _implementers(decl, callee.full_name)
+    if len(impls) == 1:
+        return impls[0], None
+    if len(impls) > 1:
+        return None, f"cross-contract-ambiguous:{decl.name}:{len(impls)}-impls"
+    return None, f"cross-contract-no-impl:{decl.name}"
 
 
 def resolved_internal_calls(function: Function) -> list[tuple[Node, InternalCall, Function]]:

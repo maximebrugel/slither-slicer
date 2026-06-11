@@ -10,14 +10,17 @@ from typing import TYPE_CHECKING
 
 from slither.core.declarations import SolidityVariableComposed
 
-from .catalog.access import caller_check_nodes
+from .calls import _location
+from .catalog.access import caller_check_nodes, is_guarded
 from .catalog.sinks import find_sinks
 from .catalog.sources import find_sources
 from .criteria import Direction, SliceCriterion
 from .dependence.data import op_reads
+from .dependence.storage import build_storage_xref
 from .graph import resolve_node
 from .loader import Loader
 from .model import Slice, SliceNode, SourceRef
+from .patterns import audit_overview as _audit_overview
 from .slicer import _Slicer, backward_slice, forward_slice
 
 if TYPE_CHECKING:
@@ -105,17 +108,73 @@ class Slicer:
             return max(touching, key=lambda n: n.source_mapping.start)
         return min(touching, key=lambda n: n.source_mapping.start)
 
-    # -- catalog-driven ----------------------------------------------------
-    def slice_all_sinks(self, contract: str | None = None) -> list[Slice]:
-        c = self._contract(contract)
-        return [backward_slice(c, crit) for crit in find_sinks(c)]
+    # -- triage ------------------------------------------------------------
+    def audit_overview(self, contract: str | None = None) -> list[dict]:
+        """The attack surface of a contract in one call: one row per external
+        entry point with guard status, value movement, external calls, sink
+        origins and the CEI ordering flag. The agent's first move."""
+        return _audit_overview(self._contract(contract))
 
-    def slice_all_sources(self, contract: str | None = None) -> list[Slice]:
+    def state_var_xref(self, contract: str | None, variable: str) -> dict:
+        """Readers and writers of a state variable across the contract
+        (inherited-inclusive), each with location, node_id, guard status and
+        entry-point reachability. The cheap orientation tool — to pull this
+        dataflow *into* a slice, use ``backward_slice(..., storage_depth=1)``."""
         c = self._contract(contract)
-        return [forward_slice(c, crit) for crit in find_sources(c)]
+        sv = next((v for v in c.state_variables if v.name == variable), None)
+        if sv is None:
+            avail = ", ".join(sorted(v.name for v in c.state_variables))
+            raise ValueError(
+                f"state variable {variable!r} not found in {c.name}. available: {avail}"
+            )
+        xref = build_storage_xref(c)
+
+        def entry(fn: Function, node: Node, reason: str) -> dict:
+            return {
+                "function": fn.canonical_name,
+                "location": _location(node),
+                "node_id": f"{fn.canonical_name}#{node.node_id}",
+                "guarded": is_guarded(fn),
+                "is_entry_point": fn.visibility in ("public", "external"),
+                "reason": reason,
+            }
+
+        return {
+            "contract": c.name,
+            "state_var": sv.name,
+            "type": str(sv.type),
+            "readers": [entry(f, n, "read") for f, n in xref.readers.get(sv.canonical_name, [])],
+            "writers": [entry(f, n, "write") for f, n in xref.writers.get(sv.canonical_name, [])],
+        }
+
+    # -- catalog-driven ----------------------------------------------------
+    def slice_all_sinks(
+        self,
+        contract: str | None = None,
+        storage_depth: int = 0,
+        cross_contract: bool = False,
+    ) -> list[Slice]:
+        c = self._contract(contract)
+        return [
+            backward_slice(c, crit, storage_depth=storage_depth, cross_contract=cross_contract)
+            for crit in find_sinks(c)
+        ]
+
+    def slice_all_sources(
+        self, contract: str | None = None, cross_contract: bool = False
+    ) -> list[Slice]:
+        c = self._contract(contract)
+        return [forward_slice(c, crit, cross_contract=cross_contract) for crit in find_sources(c)]
 
     # -- explicit criteria -------------------------------------------------
-    def backward_slice(self, function: str, variable: str | None = None, depth: int = 1) -> Slice:
+    def backward_slice(
+        self,
+        function: str,
+        variable: str | None = None,
+        depth: int = 1,
+        storage_depth: int = 0,
+        cross_contract: bool = False,
+    ) -> Slice:
         contract, func = self._resolve_function(function)
         var = self._resolve_variable(func, variable) if variable else None
         node = (
@@ -124,9 +183,17 @@ class Slicer:
             else (func.entry_point or func.nodes[0])
         )
         crit = SliceCriterion(node=node, variable=var, direction=Direction.BACKWARD)
-        return backward_slice(contract, crit, depth=depth)
+        return backward_slice(
+            contract, crit, depth=depth, storage_depth=storage_depth, cross_contract=cross_contract
+        )
 
-    def forward_slice(self, function: str, variable: str | None = None, depth: int = 1) -> Slice:
+    def forward_slice(
+        self,
+        function: str,
+        variable: str | None = None,
+        depth: int = 1,
+        cross_contract: bool = False,
+    ) -> Slice:
         contract, func = self._resolve_function(function)
         var = self._resolve_variable(func, variable) if variable else None
         node = (
@@ -135,7 +202,7 @@ class Slicer:
             else (func.entry_point or func.nodes[0])
         )
         crit = SliceCriterion(node=node, variable=var, direction=Direction.FORWARD)
-        return forward_slice(contract, crit, depth=depth)
+        return forward_slice(contract, crit, depth=depth, cross_contract=cross_contract)
 
     def slice_at_node(
         self,
@@ -143,6 +210,8 @@ class Slicer:
         variable: str | None = None,
         direction: Direction = Direction.BACKWARD,
         depth: int = 1,
+        storage_depth: int = 0,
+        cross_contract: bool = False,
     ) -> Slice:
         """Slice from an exact node — ``node_id`` as emitted in slices and
         catalog summaries (``"Vault.withdraw(uint256)#5"``). This is the drill-in
@@ -153,8 +222,14 @@ class Slicer:
         var = self._resolve_variable(node.function, variable) if variable else None
         crit = SliceCriterion(node=node, variable=var, direction=direction)
         if direction is Direction.BACKWARD:
-            return backward_slice(contract, crit, depth=depth)
-        return forward_slice(contract, crit, depth=depth)
+            return backward_slice(
+                contract,
+                crit,
+                depth=depth,
+                storage_depth=storage_depth,
+                cross_contract=cross_contract,
+            )
+        return forward_slice(contract, crit, depth=depth, cross_contract=cross_contract)
 
     # -- access control ----------------------------------------------------
     def access_control_of(self, function: str) -> Slice:

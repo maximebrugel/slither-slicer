@@ -20,6 +20,7 @@ from slither.slithir.operations import (
 )
 from slither.slithir.variables import Constant
 
+from ..calls import token_sink_origin
 from ..criteria import Direction, SliceCriterion
 from ..dependence.data import base_of_reference
 
@@ -109,6 +110,16 @@ def _call_sink_for_op(node, op: Operation) -> list[SliceCriterion]:
         if _has_nonzero_value(op):
             return [_crit(node, op.call_value, "sink:ether_transfer")]
         return [_crit(node, None, _external_origin(node, op))]
+
+    # Token value-movement (ERC20/721): matched by method name on a
+    # contract/interface call. Caught for LibraryCall too (the SafeERC20 wrapper
+    # pattern) — those are descended, so the value movement would otherwise be
+    # invisible at the calling contract. Whole-node criterion captures both the
+    # recipient and the amount flowing into the call.
+    if isinstance(op, (HighLevelCall, LibraryCall)):
+        token = token_sink_origin(op)
+        if token is not None:
+            return [_crit(node, None, token)]
 
     # LibraryCall is a HighLevelCall subclass but is in-scope code we descend
     # into — never a (dangerous, opaque) external-call sink.
