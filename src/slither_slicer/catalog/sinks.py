@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from slither.core.cfg.node import NodeType
 from slither.slithir.operations import (
     HighLevelCall,
+    LibraryCall,
     LowLevelCall,
     Operation,
     Send,
@@ -20,6 +21,7 @@ from slither.slithir.operations import (
 from slither.slithir.variables import Constant
 
 from ..criteria import Direction, SliceCriterion
+from ..dependence.data import base_of_reference
 
 if TYPE_CHECKING:
     from slither.core.cfg.node import Node
@@ -98,17 +100,32 @@ def _call_sink_for_op(node, op: Operation) -> list[SliceCriterion]:
     if isinstance(op, LowLevelCall):
         fname = str(op.function_name)
         if fname == "delegatecall":
-            return [_crit(node, op.destination, "sink:delegatecall")]
+            # whole-node criterion: trace everything flowing into the call
+            return [_crit(node, None, "sink:delegatecall")]
         if _has_nonzero_value(op):
             return [_crit(node, op.call_value, "sink:ether_transfer")]
-        return [_crit(node, op.destination, "sink:external_call")]
+        return [_crit(node, None, _external_origin(node, op))]
 
-    if isinstance(op, HighLevelCall) and not _is_view_or_pure(op):
+    # LibraryCall is a HighLevelCall subclass but is in-scope code we descend
+    # into — never a (dangerous, opaque) external-call sink.
+    is_true_external = isinstance(op, HighLevelCall) and not isinstance(op, LibraryCall)
+    if is_true_external and not _is_view_or_pure(op):
         if _has_nonzero_value(op):
             return [_crit(node, op.call_value, "sink:ether_transfer")]
-        return [_crit(node, op.destination, "sink:external_call")]
+        return [_crit(node, None, _external_origin(node, op))]
 
     return []
+
+
+def _external_origin(node: Node, op) -> str:
+    """``sink:arbitrary_call`` when the call *target* is attacker-controlled (a
+    public/external function parameter), else ``sink:external_call``."""
+    dest = base_of_reference(getattr(op, "destination", None))
+    nsv = getattr(dest, "non_ssa_version", dest)
+    func = node.function
+    if func.visibility in _ENTRY_VISIBILITY and nsv in func.parameters:
+        return "sink:arbitrary_call"
+    return "sink:external_call"
 
 
 def _is_state_var(var) -> bool:

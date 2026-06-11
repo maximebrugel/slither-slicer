@@ -116,13 +116,21 @@ source, never a paraphrase. Each node is tagged with **why** it was included:
 | `modifier-guard` | a modifier node guarding the enclosing function |
 | `callee` | reached by one level of inter-procedural descent/ascent |
 
-A slice also surfaces `functions_touched`, `state_vars_read`, `state_vars_written`,
-`external_calls` (opaque boundaries hit), and `notes` (limitations triggered).
+A slice also surfaces:
+
+- `guarded` — does the criterion's function restrict its caller? (modifier, an
+  in-body `require(msg.sender == …)`, or Slither's `is_protected`). An unguarded
+  value/authority/state sink is the headline audit signal.
+- `calls` — **every** call in the slice, classified: `library`/`internal` are
+  in-scope (we descended into them), `external`/`delegatecall`/`low_level` are
+  opaque boundaries. `external_calls` is the opaque subset as strings.
+- `events_emitted`, `entry_points` (external functions that reach the criterion),
+  `state_vars_read`/`written` + `state_var_types`, `functions_touched`, `notes`.
 
 ### Output schema
 
 The `to_json()` shape is the contract between this slicer and the Phase 3
-retrieval tools — **frozen**. See `tests/test_model.py` for the asserted schema.
+retrieval tools. See `tests/test_model.py` for the asserted schema.
 
 ## How it works
 
@@ -135,16 +143,21 @@ retrieval tools — **frozen**. See `tests/test_model.py` for the asserted schem
   **not** post-dominators, so we compute them on the reversed CFG. A Solidity
   wrinkle: `require`/`assert`/`revert` are linear `SolidityCall`s, not branches —
   we model their abort path with a virtual edge to the exit so every statement
-  after a `require` is correctly control-dependent on it.
+  after a `require` is correctly control-dependent on it. A call into in-scope
+  code that itself reverts (a validation library like `LibChecks.checkNotZero`)
+  is recognised the same way, so it guards its callsite like an inline `require`.
 - **PDG + slicing** (`pdg.py`, `slicer.py`) — a slice is reachability over the
   union of those edges, plus modifier-guard inclusion and one level of
   inter-procedural stitching (`interproc.py`). Slither's SSA already inlines a
   callee's formals as entry `Phi`s of the caller's actuals, which we use to map
-  arguments across the call boundary.
+  arguments across the call boundary. **Library calls** (`using Lib for T`) are
+  in-scope code, so they are descended into like internal calls — not treated as
+  opaque (this recovers the bulk of a real project's call graph).
 - **Catalog** (`catalog/`) — Solidity-specific sink/source detectors that produce
   criteria automatically (ether transfers, external calls, `delegatecall`,
-  `selfdestruct`, privileged state writes; parameters, `msg.sender`/`tx.origin`,
-  `msg.value`, environment/oracle returns).
+  `selfdestruct`, privileged state writes, arbitrary-call to an attacker-
+  controlled target; parameters, `msg.sender`/`tx.origin`, `msg.value`,
+  environment/oracle returns).
 
 ## Known limitations (marked, never silently dropped)
 
@@ -160,8 +173,10 @@ going when it hits:
   that reasoning).
 - **Inter-procedural depth** — one level only; deeper calls are marked
   (`interproc-depth-limit:<fn>`).
-- **External / proxy / `delegatecall` boundaries** — `HighLevelCall`s to other
-  contracts are opaque; recorded in `external_calls`, not descended into.
+- **External / proxy / `delegatecall` boundaries** — calls to *other contracts*
+  are opaque; recorded in `external_calls` / `calls` (kind `external`/`low_level`/
+  `delegatecall`), not descended into. (In-scope **library** calls are *not*
+  boundaries — they are descended into.)
 
 ## Tests
 

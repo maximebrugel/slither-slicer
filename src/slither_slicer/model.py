@@ -86,7 +86,12 @@ class Slice:
     functions_touched: list[str] = field(default_factory=list)
     state_vars_read: list[str] = field(default_factory=list)
     state_vars_written: list[str] = field(default_factory=list)
+    state_var_types: dict[str, str] = field(default_factory=dict)  # name -> declared type
     external_calls: list[str] = field(default_factory=list)  # opaque boundaries hit
+    calls: list[dict] = field(default_factory=list)  # every call, classified (see calls.py)
+    guarded: bool = False  # does the criterion's function restrict its caller?
+    events_emitted: list[dict] = field(default_factory=list)  # {name, location}
+    entry_points: list[str] = field(default_factory=list)  # external fns reaching the criterion
     notes: list[str] = field(default_factory=list)  # limitations triggered
 
     def to_source(self) -> str:
@@ -121,10 +126,15 @@ class Slice:
     def to_json(self) -> dict:
         return {
             "criterion": self.criterion.to_json(),
+            "guarded": self.guarded,
             "functions_touched": self.functions_touched,
+            "entry_points": self.entry_points,
             "state_vars_read": self.state_vars_read,
             "state_vars_written": self.state_vars_written,
+            "state_var_types": self.state_var_types,
             "external_calls": self.external_calls,
+            "calls": self.calls,
+            "events_emitted": self.events_emitted,
             "notes": self.notes,
             "nodes": [n.to_json() for n in self.nodes],
         }

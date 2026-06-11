@@ -22,13 +22,20 @@ from typing import TYPE_CHECKING
 
 from slither.core.cfg.node import NodeType
 from slither.core.declarations import SolidityVariableComposed
-from slither.slithir.operations import HighLevelCall, InternalCall, LowLevelCall, Phi
+from slither.slithir.operations import EventCall, Phi
 from slither.slithir.variables import Constant
 
+from .calls import _location, classify_call, is_opaque_kind
+from .catalog.access import is_guarded
 from .catalog.sinks import _is_state_var
 from .criteria import Direction, SliceCriterion
 from .dependence.data import base_of_reference, imprecise_index, op_defs, op_reads
-from .interproc import MAX_BOUNDARY_CROSSINGS, actual_to_formal, callsites_of
+from .interproc import (
+    MAX_BOUNDARY_CROSSINGS,
+    actual_to_formal,
+    callsites_of,
+    is_descendable_call,
+)
 from .model import Slice, SliceNode, SourceRef
 from .pdg import build_pdg
 
@@ -68,6 +75,8 @@ class _Slicer:
         self.included: dict[Node, str] = {}  # node -> reason
         self.notes: list[str] = []
         self.external_calls: list[str] = []
+        self.calls: list[dict] = []
+        self.events_emitted: list[dict] = []
         self._visited: set[int] = set()
         # worklist entries: (ssa_var, owning_function, crossings)
         self._work: list[tuple[object, Function, int]] = []
@@ -165,7 +174,7 @@ class _Slicer:
                         self._push(r, function, crossings)
                 continue
             self._add_node(dnode, "callee" if crossings > 0 else "data-dep")
-            if isinstance(dop, InternalCall) and not dop.is_modifier_call and dop.function:
+            if is_descendable_call(dop):
                 self._descend_backward(dop, crossings)
             for r in op_reads(dop):
                 self._push(r, function, crossings)
@@ -188,7 +197,8 @@ class _Slicer:
             if idx < len(op.arguments):
                 self._push(op.arguments[idx], node.function, crossings + 1)
 
-    def _descend_backward(self, op: InternalCall, crossings: int) -> None:
+    def _descend_backward(self, op, crossings: int) -> None:
+        # op is a descendable call (InternalCall or LibraryCall); see is_descendable_call.
         if crossings >= MAX_BOUNDARY_CROSSINGS:
             self._note(f"interproc-depth-limit:{op.function.canonical_name}")
             return
@@ -232,12 +242,13 @@ class _Slicer:
                     continue
                 if unode.type not in _SCAFFOLDING:
                     self._add_node(unode, "callee" if crossings > 0 else "data-dep")
-                if isinstance(uop, InternalCall) and not uop.is_modifier_call and uop.function:
+                if is_descendable_call(uop):
                     self._descend_forward(uop, var, crossings)
                 for d in op_defs(uop):
                     self._push(d, function, crossings)
 
-    def _descend_forward(self, op: InternalCall, tainted_actual, crossings: int) -> None:
+    def _descend_forward(self, op, tainted_actual, crossings: int) -> None:
+        # op is a descendable call (InternalCall or LibraryCall); see is_descendable_call.
         if crossings >= MAX_BOUNDARY_CROSSINGS:
             self._note(f"interproc-depth-limit:{op.function.canonical_name}")
             return
@@ -293,18 +304,28 @@ class _Slicer:
 
     # == helpers ===========================================================
     def _collect_metadata(self) -> None:
-        """Scan the final node set for two things worth surfacing:
+        """Scan the final node set and surface:
 
-        - external-call boundaries (``HighLevelCall`` is opaque; a value-bearing
-          ``LowLevelCall`` is the transfer itself), and
+        - every call, **classified** (library/internal = in-scope and descended;
+          external/delegatecall/low_level = opaque boundaries),
+        - the opaque subset as ``external_calls`` (back-compat string list) — note
+          library calls are *excluded*, since we followed them,
+        - emitted events, and
         - imprecise aliasing through non-constant mapping/array/struct indices.
         """
+        seen_calls: set[str] = set()
         for node in self.included:
             for op in node.irs_ssa:
-                if isinstance(op, (HighLevelCall, LowLevelCall)):
-                    text = str(op.expression) if op.expression is not None else str(op)
-                    if text not in self.external_calls:
-                        self.external_calls.append(text)
+                info = classify_call(op, node)
+                if info is not None and info["expr"] not in seen_calls:
+                    seen_calls.add(info["expr"])
+                    self.calls.append(info)
+                    if is_opaque_kind(info["kind"]) and info["expr"] not in self.external_calls:
+                        self.external_calls.append(info["expr"])
+                if isinstance(op, EventCall):
+                    self.events_emitted.append(
+                        {"name": op.name, "location": _location(node)}
+                    )
                 res = imprecise_index(op)
                 if res is not None:
                     base, _index = res
@@ -323,6 +344,7 @@ class _Slicer:
         functions_touched: list[str] = []
         state_read: list[str] = []
         state_written: list[str] = []
+        state_types: dict[str, str] = {}
 
         for node, reason in ordered:
             fname = node.function.canonical_name
@@ -341,9 +363,11 @@ class _Slicer:
             for sv in node.state_variables_read:
                 if str(sv) not in state_read:
                     state_read.append(str(sv))
+                state_types.setdefault(str(sv), str(sv.type))
             for sv in node.state_variables_written:
                 if str(sv) not in state_written:
                     state_written.append(str(sv))
+                state_types.setdefault(str(sv), str(sv.type))
 
         return Slice(
             criterion=criterion,
@@ -351,9 +375,27 @@ class _Slicer:
             functions_touched=functions_touched,
             state_vars_read=state_read,
             state_vars_written=state_written,
+            state_var_types=state_types,
             external_calls=list(self.external_calls),
+            calls=list(self.calls),
+            guarded=is_guarded(criterion.node.function),
+            events_emitted=list(self.events_emitted),
+            entry_points=self._entry_points_reaching(criterion.node.function),
             notes=list(self.notes),
         )
+
+    @staticmethod
+    def _entry_points_reaching(function: Function) -> list[str]:
+        """External/public functions from which an attacker can reach ``function``
+        (itself included if it is an entry point)."""
+        out: list[str] = []
+        seen = set()
+        candidates = {function} | set(getattr(function, "all_reachable_from_functions", set()))
+        for f in candidates:
+            if f.visibility in ("public", "external") and f.canonical_name not in seen:
+                seen.add(f.canonical_name)
+                out.append(f.canonical_name)
+        return sorted(out)
 
 
 def backward_slice(contract: Contract, criterion: SliceCriterion) -> Slice:

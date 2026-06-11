@@ -37,6 +37,11 @@ def tainted_index() -> Slicer:
     return _slicer("TaintedIndex.sol")
 
 
+@pytest.fixture(scope="session")
+def library() -> Slicer:
+    return _slicer("Library.sol")
+
+
 def node_set(sl) -> set[tuple[str, str]]:
     """(node_id, reason) pairs for a slice."""
     return {(n.node_id, n.reason) for n in sl.nodes}

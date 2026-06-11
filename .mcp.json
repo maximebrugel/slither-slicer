@@ -3,9 +3,14 @@
     "slither-slicer": {
       "type": "stdio",
       "command": "uv",
-      "args": ["run", "--extra", "mcp", "slither-slicer-mcp"],
+      "args": [
+        "run",
+        "--directory", "/Users/maxime/Development/slither-slicer",
+        "--extra", "mcp",
+        "slither-slicer-mcp"
+      ],
       "env": {
-        "SLITHER_SLICER_PROJECT": "tests/fixtures/AccessControl.sol"
+        "SLITHER_SLICER_PROJECT": "/Users/maxime/Development/grunt"
       }
     }
   }

@@ -25,11 +25,11 @@ import os
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import FastMCP
-from slither.slithir.operations import HighLevelCall, LowLevelCall
 
 from . import Slicer
 from . import graph as g
-from .interproc import callsites_of, resolved_internal_calls
+from .calls import classify_call
+from .interproc import callsites_of
 
 if TYPE_CHECKING:
     from slither.core.cfg.node import Node
@@ -81,9 +81,13 @@ def _summarize(s: Slice) -> dict:
         "direction": crit.direction.name,
         "location": _location(crit.node),
         "criterion_node_id": g.global_node_id(crit.node),
+        "guarded": s.guarded,
         "node_count": len(s.nodes),
         "state_vars_written": s.state_vars_written,
         "external_calls": s.external_calls,
+        "call_kinds": sorted({c["kind"] for c in s.calls}),
+        "events_emitted": [e["name"] for e in s.events_emitted],
+        "entry_points": s.entry_points,
         "notes": s.notes,
     }
 
@@ -173,24 +177,26 @@ def find_callers_impl(function: str, project: str | None = None) -> dict:
 
 
 def find_callees_impl(function: str, project: str | None = None) -> dict:
+    """Calls made by ``function``, split into in-scope (internal + library, which
+    the slicer descends into) and opaque external boundaries."""
     sl = _get_slicer(project)
     _contract, func = sl._resolve_function(function)
-    internal = [
-        {"callee": callee.canonical_name, "location": _location(node)}
-        for node, _op, callee in resolved_internal_calls(func)
-    ]
-    # External calls (High/Low-level) are opaque boundaries — scan node ops, the
-    # same way the slicer collects them, rather than trusting any one accessor.
-    external = []
+    in_scope, external = [], []
     seen: set[str] = set()
     for node in func.nodes:
         for op in node.irs_ssa:
-            if isinstance(op, (HighLevelCall, LowLevelCall)):
-                text = str(op.expression) if op.expression is not None else str(op)
-                if text not in seen:
-                    seen.add(text)
-                    external.append({"call": text, "location": _location(node), "opaque": True})
-    return {"function": func.canonical_name, "internal": internal, "external": external}
+            info = classify_call(op, node)
+            if info is None or info["expr"] in seen:
+                continue
+            seen.add(info["expr"])
+            entry = {
+                "call": info["expr"],
+                "kind": info["kind"],
+                "target": info["target"],
+                "location": info["location"],
+            }
+            (in_scope if info["in_scope"] else external).append(entry)
+    return {"function": func.canonical_name, "in_scope": in_scope, "external": external}
 
 
 def explain_dependence_impl(

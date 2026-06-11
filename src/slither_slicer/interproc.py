@@ -9,24 +9,54 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from slither.slithir.operations import InternalCall
+from slither.slithir.operations import InternalCall, LibraryCall
 
 if TYPE_CHECKING:
     from slither.core.cfg.node import Node
     from slither.core.declarations import Contract, Function
+    from slither.slithir.operations import Operation
 
 # How many call boundaries a single trace may cross. v1 = 1.
 MAX_BOUNDARY_CROSSINGS = 1
 
 
+def is_descendable_call(op: Operation) -> bool:
+    """True for calls we can resolve to in-scope code and descend into.
+
+    ``LibraryCall`` is a subclass of ``HighLevelCall`` but, like an
+    ``InternalCall``, targets resolvable in-scope code (``using Lib for T`` /
+    ``Lib.fn(...)``) — so it is stitched, not treated as an opaque boundary.
+    Modifier invocations are handled separately (always pulled in as guards).
+    """
+    if isinstance(op, LibraryCall):
+        return op.function is not None
+    if isinstance(op, InternalCall):
+        return not op.is_modifier_call and op.function is not None
+    return False
+
+
 def resolved_internal_calls(function: Function) -> list[tuple[Node, InternalCall, Function]]:
-    """Every resolved, non-modifier internal call in ``function``:
+    """Every resolved, non-modifier *internal* call in ``function``:
     ``(node, op, callee)``.
+
+    Internal calls only — this backs ``callsites_of`` (used for **ascent**),
+    where climbing out of a library function to all its callsites would explode.
+    We descend *into* libraries but never ascend *out* of them.
     """
     out = []
     for node in function.nodes:
         for op in node.irs_ssa:
             if isinstance(op, InternalCall) and not op.is_modifier_call and op.function is not None:
+                out.append((node, op, op.function))
+    return out
+
+
+def resolved_library_calls(function: Function) -> list[tuple[Node, LibraryCall, Function]]:
+    """Every resolved library call in ``function``: ``(node, op, callee)``."""
+    out = []
+    for node in function.nodes:
+        for op in node.irs_ssa:
+            if isinstance(op, LibraryCall) and op.function is not None:
                 out.append((node, op, op.function))
     return out
 

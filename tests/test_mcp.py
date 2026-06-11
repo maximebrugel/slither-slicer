@@ -52,9 +52,13 @@ def test_slice_all_sinks_is_compact_catalog():
         "direction",
         "location",
         "criterion_node_id",
+        "guarded",
         "node_count",
         "state_vars_written",
         "external_calls",
+        "call_kinds",
+        "events_emitted",
+        "entry_points",
         "notes",
     }
     assert "nodes" not in sample
@@ -92,11 +96,12 @@ def test_find_callers_and_callees_interproc():
 
     callees = m.find_callees_impl("Interproc.withdraw(uint256)", IP)
     assert any(
-        c["callee"] == "Interproc._transfer(address,uint256)" for c in callees["internal"]
+        c["target"] == "Interproc._transfer(address,uint256)" and c["kind"] == "internal"
+        for c in callees["in_scope"]
     )
     # the external call lives in _transfer, not withdraw
     ext = m.find_callees_impl("Interproc._transfer(address,uint256)", IP)["external"]
-    assert ext and ext[0]["opaque"] is True
+    assert ext and ext[0]["kind"] in ("external", "low_level", "delegatecall")
 
 
 def test_find_callers_marks_entry_point():

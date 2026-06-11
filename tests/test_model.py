@@ -11,10 +11,15 @@ import json
 
 REQUIRED_TOP_LEVEL = {
     "criterion",
+    "guarded",
     "functions_touched",
+    "entry_points",
     "state_vars_read",
     "state_vars_written",
+    "state_var_types",
     "external_calls",
+    "calls",
+    "events_emitted",
     "notes",
     "nodes",
 }

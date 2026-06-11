@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from slither.core.declarations import SolidityVariableComposed
-from slither.slithir.operations import HighLevelCall
+from slither.slithir.operations import HighLevelCall, LibraryCall
 
 from ..criteria import Direction, SliceCriterion
 
@@ -59,8 +59,13 @@ def find_sources(contract: Contract) -> list[SliceCriterion]:
                         seen.add(key)
                         origin = _origin_for(str(var))
                         crits.append(_crit(node, var, origin))
-                # Return values of external high-level calls (oracle-ish).
-                if isinstance(op, HighLevelCall) and getattr(op, "lvalue", None) is not None:
+                # Return values of *true external* calls are untrusted (oracle-ish);
+                # library returns are our own trusted code, so they are excluded.
+                if (
+                    isinstance(op, HighLevelCall)
+                    and not isinstance(op, LibraryCall)
+                    and getattr(op, "lvalue", None) is not None
+                ):
                     crits.append(_crit(node, op.lvalue, "source:external_return"))
     return crits
 

@@ -9,8 +9,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from slither.core.declarations import SolidityVariableComposed
-from slither.slithir.operations import SolidityCall
 
+from .catalog.access import caller_check_nodes
 from .catalog.sinks import find_sinks
 from .catalog.sources import find_sources
 from .criteria import Direction, SliceCriterion
@@ -31,8 +31,6 @@ __all__ = [
     "SliceCriterion",
     "Direction",
 ]
-
-_CALLER_VARS = {"msg.sender", "tx.origin"}
 
 
 def _split_function_spec(spec: str) -> tuple[str | None, str]:
@@ -151,25 +149,10 @@ class Slicer:
             origin="access-control",
         )
         sc._include_modifier_guards(func)
-        for n in func.nodes:
-            if _is_caller_check(n):
-                sc._add_node(n, "control-dep")
-                for op in n.irs_ssa:
-                    for r in op_reads(op):
-                        sc._push(r, func, 0)
+        for n in caller_check_nodes(func):
+            sc._add_node(n, "control-dep")
+            for op in n.irs_ssa:
+                for r in op_reads(op):
+                    sc._push(r, func, 0)
         sc._saturate_backward()
         return sc._finish(crit)
-
-
-def _is_caller_check(node: Node) -> bool:
-    has_require = any(
-        isinstance(op, SolidityCall) and op.function.name.startswith(("require(", "assert("))
-        for op in node.irs_ssa
-    )
-    if not has_require:
-        return False
-    for op in node.irs_ssa:
-        for v in op.read:
-            if isinstance(v, SolidityVariableComposed) and str(v) in _CALLER_VARS:
-                return True
-    return False

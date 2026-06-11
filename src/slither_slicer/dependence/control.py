@@ -13,14 +13,17 @@ A wrinkle specific to Solidity: ``require``/``assert``/``revert`` do *not* creat
 a branch node in Slither's CFG — they are linear ``SolidityCall`` expressions
 that may abort. We model that abort path by giving such nodes a virtual edge to
 the exit, which makes every statement after a ``require`` correctly
-control-dependent on it.
+control-dependent on it. The same applies to a call into in-scope code (an
+internal or library function) whose body can revert — a ``LibChecks.checkNotZero``
+guards its callsite exactly like an inline ``require``.
 """
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
-from slither.slithir.operations import SolidityCall
+from slither.slithir.operations import InternalCall, LibraryCall, SolidityCall
 
 if TYPE_CHECKING:
     from slither.core.cfg.node import Node
@@ -31,14 +34,37 @@ _EXIT = "__EXIT__"  # virtual exit sentinel
 _ABORT_PREFIXES = ("require(", "assert(", "revert(", "revert ")
 
 
+def _is_revert_solidity_call(op) -> bool:
+    return isinstance(op, SolidityCall) and op.function.name.startswith(_ABORT_PREFIXES)
+
+
+@lru_cache(maxsize=512)
+def _callee_can_revert(function: Function) -> bool:
+    """One-level check: does ``function``'s own body contain a ``require``/
+    ``assert``/``revert`` (or a ``THROW``)? Used to recognise that a call to a
+    *validation library* (``LibChecks.checkNotZero``) aborts the caller — so the
+    callsite must guard the statements after it, exactly like an inline require."""
+    for node in function.nodes:
+        if node.type.name == "THROW":
+            return True
+        if any(_is_revert_solidity_call(op) for op in node.irs_ssa):
+            return True
+    return False
+
+
 def _is_abort_node(node: Node) -> bool:
-    """True if executing ``node`` can abort the function (``require``/``assert``/
-    ``revert``), giving it an implicit edge to the exit."""
+    """True if executing ``node`` can abort the function — a direct
+    ``require``/``assert``/``revert``, or a call into in-scope code (internal or
+    library) that itself reverts. Both get an implicit edge to the exit so the
+    statements they guard become control-dependent on them."""
     for op in node.irs_ssa:
-        if isinstance(op, SolidityCall):
-            name = op.function.name
-            if name.startswith(("require(", "assert(", "revert(")):
-                return True
+        if _is_revert_solidity_call(op):
+            return True
+        if isinstance(op, (InternalCall, LibraryCall)):
+            callee = getattr(op, "function", None)
+            if callee is not None and not getattr(op, "is_modifier_call", False):
+                if _callee_can_revert(callee):
+                    return True
     # NodeType.THROW handled via terminal detection (no sons -> connects to exit)
     return False
 
