@@ -117,20 +117,31 @@ The raw PDG (for a human) is at `slither-slicer <project> --pdg "Vault.withdraw(
 
 ### Agentic inspection (opt-in)
 
-An LLM sub-agent is admissible in exactly one place: **where deterministic analysis
-has already bottomed out** and the engine emitted a marker instead of a fact — the
-`delegatecall` boundary it never descends. Everything else stays deterministic; an
-LLM there would only add noise and cost.
+An LLM sub-agent is admissible only where the deterministic engine has either **bottomed
+out** (emitting a marker instead of a fact) or produced a **complete substrate** the model
+can reason *on top of* — never where it would re-derive structure Slither already knows.
+Both tools navigate with a fresh, read-only slicer instance (the seam stays deterministic,
+one hop further out), tie every claim to a `node_id` + byte-exact source, mark anything
+unresolved rather than **guess**, and support `dry_run` (the seed prompt without spending
+tokens — the agentic analogue of `--pdg`).
 
-`inspect_delegatecall(node_id)` seeds a sub-agent with the facts the engine already
-computed (the backward slice of the delegatecall site, the proxy's *ordered* storage
-layout) and lets it reason across the seam: which implementation actually executes,
-storage-layout collisions, unprotected init/admin reachable through the call, and
-target controllability. The sub-agent **navigates with a fresh, read-only slicer
-instance** (so the seam is still answered deterministically, one hop further out) and
-returns a structured verdict — every claim tied to a `node_id` + byte-exact source,
-and anything it can't resolve marked under `unresolved`, **never guessed**. `dry_run`
-returns the seed prompt without spending tokens (the agentic analogue of `--pdg`).
+`inspect_delegatecall(node_id)` — *bottomed-out boundary.* Seeds the sub-agent with the
+backward slice of the delegatecall site and the proxy's *ordered* storage layout, and lets
+it reason across the seam: which implementation actually executes, storage-layout
+collisions, unprotected init/admin reachable through the call, and target controllability.
+
+`check_state_invariant(contract, state_var, related=…)` — *complete substrate.* The
+hardest, highest-value bug class (accounting drift, share inflation,
+under-collateralization) — a *semantic* property nowhere in the source, so static analysis
+can't pattern-match it. Built on `state_var_xref`'s **complete writer set**: the agent is
+handed *every* writer of the variable (each pre-tagged `guarded`/`is_entry_point`) plus the
+complete writer sets of same-type siblings and any caller-named `related` vars, and does the
+one thing the engine can't — name the intended invariant and decide which writers break it.
+It **cannot under-count mutation sites** (every writer is given; coverage is machine-enforced
+— the verdict must disposition exactly the complete set), and the validator rejects any
+finding citing a node outside the deterministic writer/reader set. The headline
+`hypothesized_invariants` is the risk surface a human accepts or rejects before trusting any
+finding. Returns `no-writers` for an unwritten variable.
 
 This layer is **off by default** — the deterministic build is free and golden-testable.
 It registers only when `SLITHER_SLICER_ENABLE_AGENT=1`, and it requires:
@@ -163,18 +174,21 @@ instruction. **But** the installed Kimi CLI (v0.14.3) auto-approves tool calls i
 print mode and exposes shell/write builtins (`Bash`/`Write`/`Edit`) that no CLI flag
 or config can disable — so a *hard* read-only toolset cannot be guaranteed. Since the
 analyzed Solidity is untrusted input, a prompt-injection → auto-approved-shell path is
-a real RCE vector. Therefore live execution is **fail-closed**: `inspect_delegatecall`
-returns `status: "blocked"` unless you explicitly acknowledge the risk with
+a real RCE vector. Therefore live execution is **fail-closed**: the agentic tools return
+`status: "blocked"` unless you explicitly acknowledge the risk with
 `SLITHER_SLICER_AGENT_ALLOW_SHELL=1` (intended for a trusted target in a sandboxed
 environment). `dry_run` always works without it. (`SLITHER_SLICER_AGENT_TIMEOUT`
 overrides the 300s wall-clock budget.)
 
-If `kimi` is absent or not logged in the tool returns `status: "unavailable"`; any
-malformed/non-conforming verdict returns an error status — it never fabricates a
-finding. **Trust caveat:** storage-collision reasoning rests on the LLM computing slot
-packing from the seeded layout (the engine does not compute slots), so treat a
-`storage-collision` finding as a lead to verify, with its cited `node_id`/source, not a
-proven fact.
+If `kimi` is absent or not logged in the tools return `status: "unavailable"`; any
+malformed/non-conforming verdict returns an error status — they never fabricate a finding.
+**Trust caveats** (cited claims are leads to verify, not proven facts): (1) for
+`inspect_delegatecall`, storage-collision reasoning rests on the LLM computing slot packing
+from the seeded layout (the engine does not compute slots); (2) for `check_state_invariant`,
+the *invariant hypothesis* is the model's (surfaced as the headline `hypothesized_invariants`),
+and the writer set is complete only as far as Slither attributes writes — inline-assembly
+`sstore`, writes via another contract delegatecalling into this storage, and imprecise-alias
+writes are surfaced via a `completeness_caveat`/`unresolved`, not silently assumed away.
 
 ## What a slice contains
 

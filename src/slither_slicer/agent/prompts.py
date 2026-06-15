@@ -84,3 +84,58 @@ def build_delegatecall_seed(
         + "\n"
         + _output_contract(schema)
     )
+
+
+# --------------------------------------------------------------------------- #
+# check_state_invariant
+# --------------------------------------------------------------------------- #
+_INVARIANT_PREAMBLE = """\
+You are a Solidity invariant-analysis sub-agent inside a static-analysis pipeline. A
+deterministic slicer has given you the COMPLETE set of writers of a state variable.
+Your job is the one thing it cannot do: state the invariant the code is meant to
+preserve, and decide which writers break it.
+
+COMPLETENESS CONTRACT (do not violate):
+- The writer set below is EXHAUSTIVE. Do NOT grep source to look for other writers.
+- To bring in a related variable, call mcp__slicer__state_var_xref on it — that returns
+  its COMPLETE writer set too. Read source ONLY to understand a write's logic, never to
+  discover a write.
+- If you believe a write exists outside the given sets, that is a slicer bug: record it
+  under "unresolved". Do NOT invent it as a finding.
+- Honor `completeness_caveat`: when it is non-null the writer set may be incomplete
+  (e.g. inline-assembly `sstore`, or writes by another contract delegatecalling into
+  this storage) — lower your confidence and note the gap under "unresolved".
+"""
+
+_INVARIANT_TASK = """\
+Your task:
+1. Hypothesize the invariant(s) this variable participates in — from its name, type, and
+   what the writers do. Prioritise RELATIONAL invariants (e.g. a supply total that must
+   equal the sum of per-account balances). State each as a checkable predicate, with what
+   you inferred it from and a confidence.
+2. Emit a disposition for EVERY writer in the complete set: holds | violates |
+   underconstrained. Use the attached guarded / entry_point flags — do not re-derive
+   them. `writer_dispositions` MUST cover exactly the given writer node_ids (no more, no
+   fewer).
+3. A "invariant-violation" finding requires a writer that breaks an invariant AND is
+   attacker-reachable (entry_point and not adequately guarded). A writer that breaks it
+   but is admin-only is at most "underconstrained-setter".
+4. Cite every claim with the writer's node_id and byte-exact source (copy the `source`
+   from the writer's write_slice). If naming/usage is too opaque to infer any invariant,
+   return status "invariant-unknown".
+"""
+
+
+def build_invariant_seed(*, facts: dict, schema: dict[str, Any]) -> str:
+    """Assemble the full seed prompt for ``check_state_invariant``. ``facts`` is the
+    deterministic seed from :func:`slither_slicer.agent.tools._invariant_seed_facts`
+    (the complete writer set + related sets + completeness caveat)."""
+    return (
+        _INVARIANT_PREAMBLE
+        + "\nDeterministic facts (authoritative — the writer set is COMPLETE):\n```json\n"
+        + json.dumps(facts, indent=2)
+        + "\n```\n\n"
+        + _INVARIANT_TASK
+        + "\n"
+        + _output_contract(schema)
+    )

@@ -45,5 +45,33 @@ def register_agent_tools(server) -> None:
         logged in."""
         return tools.inspect_delegatecall(node_id, _resolve_project(project), dry_run=dry_run)
 
+    @server.tool()
+    def check_state_invariant(
+        contract: str,
+        state_var: str,
+        related: list[str] | None = None,
+        project: str | None = None,
+        dry_run: bool = False,
+    ) -> dict:
+        """Agentic check of the state invariant(s) a variable participates in — the
+        semantic bug class (accounting drift, share inflation, under-collateralization)
+        static analysis can't pattern-match. Built on `state_var_xref`'s COMPLETE writer
+        set: the sub-agent is handed every writer of `state_var` (each pre-tagged guarded
+        / entry_point) plus the complete writer sets of same-type siblings and any
+        caller-named `related` vars, and does the one thing the engine can't — name the
+        intended invariant and decide which writers break it. It cannot under-count
+        mutation sites (every writer is given; coverage is machine-enforced); the
+        validator also rejects any finding citing a node outside the deterministic set.
+        Returns a verdict whose headline `hypothesized_invariants` a human accepts or
+        rejects before trusting findings, with a `completeness_caveat` when inline
+        assembly may hide `sstore` writes. `dry_run=true` returns the seed without
+        spending tokens (always allowed); a live run is fail-closed behind
+        SLITHER_SLICER_AGENT_ALLOW_SHELL=1, returns 'no-writers' for an unwritten
+        variable, and 'unavailable' if `kimi` is absent or not logged in. e.g.
+        contract='Vault', state_var='totalSupply', related=['balances']."""
+        return tools.check_state_invariant(
+            contract, state_var, _resolve_project(project), related=related, dry_run=dry_run
+        )
+
 
 __all__ = ["register_agent_tools"]
