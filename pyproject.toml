@@ -25,6 +25,12 @@ dev = [
 mcp = [
     "mcp>=1.2",
 ]
+# Opt-in LLM sub-agent layer (see src/slither_slicer/agent). The heavy dependency
+# (the Kimi CLI) is an external binary, documented, never vendored — Python-side
+# this pulls only a JSON-schema validator for the frozen verdict contract.
+agent = [
+    "jsonschema>=4",
+]
 
 [build-system]
 requires = ["uv_build>=0.11.16,<0.12.0"]

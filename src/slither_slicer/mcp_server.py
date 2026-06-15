@@ -458,6 +458,19 @@ def explain_dependence(
     return explain_dependence_impl(node_a_id, node_b_id, project, depth)
 
 
+# --------------------------------------------------------------------------- #
+# opt-in agent layer
+# --------------------------------------------------------------------------- #
+# The deterministic tools above are the whole default surface: free, golden-
+# testable, no LLM. The agentic tools (which drive an LLM sub-agent across the
+# opaque boundaries the engine refuses to cross) register *only* when explicitly
+# enabled, so the default build is unchanged.
+if os.environ.get("SLITHER_SLICER_ENABLE_AGENT") == "1":
+    from .agent import register_agent_tools
+
+    register_agent_tools(mcp)
+
+
 def main() -> None:
     mcp.run()
 
